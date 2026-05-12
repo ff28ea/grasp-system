@@ -1,0 +1,27 @@
+# Core scientific stack
+numpy>=1.24,<2.0
+scipy>=1.10
+
+# Computer vision
+# opencv-contrib-python is a superset of opencv-python; installing both causes
+# mixed-namespace conflicts at runtime. Pin only the contrib wheel.
+opencv-contrib-python>=4.8
+
+# RealSense D435i
+pyrealsense2>=2.54.2
+
+# 3D / point clouds
+open3d>=0.17
+
+# Instance segmentation
+ultralytics>=8.1
+torch>=2.0
+torchvision>=0.15
+
+# PiPER arm SDK (install matching version for your hardware)
+piper_sdk>=0.3
+
+# Misc utilities
+pyyaml>=6.0
+tqdm>=4.66
+matplotlib>=3.7

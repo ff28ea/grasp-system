@@ -1,0 +1,239 @@
+"""Common utilities: config loading, transform helpers, logging."""
+from __future__ import annotations
+
+import logging
+from pathlib import Path
+from typing import Any, Dict, Optional
+
+import numpy as np
+import yaml
+from scipy.spatial.transform import Rotation as R
+
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
+PKG_ROOT = Path(__file__).resolve().parent
+
+
+def project_path(rel: str | Path) -> Path:
+    """Resolve a path relative to the grasp_system package root."""
+    p = Path(rel)
+    if p.is_absolute():
+        return p
+    return PKG_ROOT / p
+
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+def get_logger(name: str = "grasp", level: int = logging.INFO) -> logging.Logger:
+    logger = logging.getLogger(name)
+    if not logger.handlers:
+        h = logging.StreamHandler()
+        fmt = logging.Formatter(
+            "[%(asctime)s][%(levelname)s][%(name)s] %(message)s",
+            datefmt="%H:%M:%S",
+        )
+        h.setFormatter(fmt)
+        logger.addHandler(h)
+    logger.setLevel(level)
+    return logger
+
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+def load_config(path: str | Path = "configs/system.yaml") -> Dict[str, Any]:
+    p = project_path(path)
+    with open(p, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f)
+
+
+def load_classes(path: str | Path = "configs/classes.yaml") -> Dict[int, Dict[str, Any]]:
+    p = project_path(path)
+    with open(p, "r", encoding="utf-8") as f:
+        data = yaml.safe_load(f) or {}
+    raw = data.get("classes", {}) or {}
+    # Normalise keys to int.
+    out: Dict[int, Dict[str, Any]] = {}
+    for k, v in raw.items():
+        out[int(k)] = v
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Rigid transforms
+# ---------------------------------------------------------------------------
+def make_transform(R_mat: np.ndarray, t: np.ndarray) -> np.ndarray:
+    """Compose a 4x4 homogeneous transform from a 3x3 rotation and 3-vector."""
+    T = np.eye(4)
+    T[:3, :3] = np.asarray(R_mat, dtype=np.float64)
+    T[:3, 3] = np.asarray(t, dtype=np.float64).reshape(3)
+    return T
+
+
+def invert_transform(T: np.ndarray) -> np.ndarray:
+    """Inverse of a rigid 4x4 transform (cheap, avoids np.linalg.inv)."""
+    T = np.asarray(T, dtype=np.float64)
+    R_m = T[:3, :3]
+    t = T[:3, 3]
+    T_inv = np.eye(4)
+    T_inv[:3, :3] = R_m.T
+    T_inv[:3, 3] = -R_m.T @ t
+    return T_inv
+
+
+def validate_transform(
+    T: np.ndarray,
+    name: str = "T",
+    rot_tol: float = 1e-3,
+    max_translation_m: Optional[float] = None,
+    logger: Optional[logging.Logger] = None,
+) -> bool:
+    """Sanity-check a 4x4 rigid transform.
+
+    Checks:
+      * shape is (4, 4);
+      * bottom row is (0, 0, 0, 1) within tolerance;
+      * rotation block is orthonormal (``R^T R = I`` within ``rot_tol``);
+      * rotation determinant is +1 (not -1 / reflection);
+      * optional translation magnitude upper bound (meters).
+
+    Returns True if the transform looks clean, False otherwise. Issues
+    are emitted as warnings via the given logger so a suspicious
+    calibration is flagged loud at load time rather than producing
+    silently wrong poses downstream.
+    """
+    log = logger or get_logger("transform")
+    T = np.asarray(T, dtype=np.float64)
+    if T.shape != (4, 4):
+        log.error("%s must be 4x4, got %s", name, T.shape)
+        return False
+    if not np.all(np.isfinite(T)):
+        log.error("%s contains NaN/Inf", name)
+        return False
+    bottom = T[3, :]
+    if not np.allclose(bottom, [0.0, 0.0, 0.0, 1.0], atol=1e-6):
+        log.warning("%s bottom row is %s, not [0 0 0 1]", name, bottom)
+
+    R_m = T[:3, :3]
+    orth_err = float(np.linalg.norm(R_m.T @ R_m - np.eye(3)))
+    det = float(np.linalg.det(R_m))
+    ok = True
+    if orth_err > rot_tol:
+        log.warning(
+            "%s rotation not orthonormal: |R^T R - I|=%.2e (> %.2e)",
+            name, orth_err, rot_tol,
+        )
+        ok = False
+    if abs(det - 1.0) > max(rot_tol, 1e-3):
+        log.warning("%s rotation det=%.4f, expected +1", name, det)
+        ok = False
+
+    if max_translation_m is not None:
+        t_norm = float(np.linalg.norm(T[:3, 3]))
+        if t_norm > max_translation_m:
+            log.warning(
+                "%s translation norm %.3f m exceeds %.3f m",
+                name, t_norm, max_translation_m,
+            )
+            ok = False
+    return ok
+
+
+def euler_xyz_deg_to_matrix(rx_deg: float, ry_deg: float, rz_deg: float) -> np.ndarray:
+    """PiPER convention: extrinsic (fixed) xyz, degrees -> 3x3 rotation matrix."""
+    return R.from_euler("xyz", [rx_deg, ry_deg, rz_deg], degrees=True).as_matrix()
+
+
+def matrix_to_euler_xyz_deg(R_mat: np.ndarray) -> np.ndarray:
+    """3x3 rotation -> extrinsic xyz Euler in degrees, matching PiPER convention."""
+    return R.from_matrix(np.asarray(R_mat)).as_euler("xyz", degrees=True)
+
+
+def rotation_angle_deg(R_a: np.ndarray, R_b: np.ndarray) -> float:
+    """Geodesic angular distance between two 3x3 rotations, in degrees.
+
+    Use this instead of comparing Euler angles component-wise: Euler
+    representation is discontinuous near gimbal lock and not a metric, so
+    per-axis absolute differences can both over- and under-estimate the
+    real rotational error.
+    """
+    R_a = np.asarray(R_a, dtype=np.float64)
+    R_b = np.asarray(R_b, dtype=np.float64)
+    R_rel = R_a.T @ R_b
+    # trace is in [-1, 3]; clamp against numerical noise before acos.
+    cos_theta = np.clip((np.trace(R_rel) - 1.0) * 0.5, -1.0, 1.0)
+    return float(np.degrees(np.arccos(cos_theta)))
+
+
+def pose_xyzrpy_to_matrix(
+    x_m: float, y_m: float, z_m: float,
+    rx_deg: float, ry_deg: float, rz_deg: float,
+) -> np.ndarray:
+    """Position (m) + Euler xyz (deg) -> 4x4 transform."""
+    T = np.eye(4)
+    T[:3, :3] = euler_xyz_deg_to_matrix(rx_deg, ry_deg, rz_deg)
+    T[:3, 3] = [x_m, y_m, z_m]
+    return T
+
+
+def matrix_to_xyzrpy(T: np.ndarray) -> np.ndarray:
+    """4x4 -> [x_m, y_m, z_m, rx_deg, ry_deg, rz_deg]."""
+    t = T[:3, 3]
+    e = matrix_to_euler_xyz_deg(T[:3, :3])
+    return np.asarray([t[0], t[1], t[2], e[0], e[1], e[2]], dtype=np.float64)
+
+
+def translate(dx: float, dy: float, dz: float) -> np.ndarray:
+    T = np.eye(4)
+    T[:3, 3] = [dx, dy, dz]
+    return T
+
+
+def camera_look_down_rotation(tilt_deg: float = 0.0, yaw_deg: float = 0.0) -> np.ndarray:
+    """Rotation making the camera optical axis (+z_cam) point towards -z_world.
+
+    Equivalent to a 180 deg rotation about world x, with optional additional
+    tilt about world x (tilt_deg) and yaw about world z (yaw_deg).
+    """
+    base = R.from_euler("x", 180.0, degrees=True)
+    extra = R.from_euler("zx", [yaw_deg, tilt_deg], degrees=True)
+    return (extra * base).as_matrix()
+
+
+# ---------------------------------------------------------------------------
+# Misc
+# ---------------------------------------------------------------------------
+def ensure_parent(path: str | Path) -> Path:
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def save_npy(path: str | Path, arr: np.ndarray) -> Path:
+    p = ensure_parent(path)
+    np.save(p, np.asarray(arr))
+    return p
+
+
+def load_npy(path: str | Path) -> np.ndarray:
+    return np.load(path, allow_pickle=False)
+
+
+def load_intrinsics(path: str | Path) -> Dict[str, Any]:
+    """Load camera intrinsics saved by calibrate_intrinsics.py."""
+    data = np.load(path, allow_pickle=False)
+    out = {
+        "K": data["K"].astype(np.float64),
+        "dist": data["dist"].astype(np.float64),
+        "width": int(data["width"]),
+        "height": int(data["height"]),
+    }
+    if "rms" in data.files:
+        out["rms"] = float(data["rms"])
+    return out
+
+
+def fx_fy_cx_cy(K: np.ndarray) -> tuple[float, float, float, float]:
+    return float(K[0, 0]), float(K[1, 1]), float(K[0, 2]), float(K[1, 2])

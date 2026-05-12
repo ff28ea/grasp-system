@@ -1,0 +1,23 @@
+# Class index -> human readable label, optional grasp hints.
+# Keep the index order identical to your YOLOv8-seg training dataset.
+classes:
+  0:
+    name: BuildingBlocks
+    approach: top_down        # top_down | side
+    max_opening_mm: 65
+    safe_height_mm: 120       # retreat height above pick point
+  1:
+    name: bottle
+    approach: top_down
+    max_opening_mm: 55
+    safe_height_mm: 140
+  2:
+    name: can
+    approach: top_down
+    max_opening_mm: 55
+    safe_height_mm: 120
+  3:
+    name: cup
+    approach: top_down
+    max_opening_mm: 60
+    safe_height_mm: 140

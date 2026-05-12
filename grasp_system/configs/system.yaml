@@ -1,0 +1,92 @@
+# Global runtime configuration for the grasp system.
+# All dimensions in SI (meters, radians, seconds) unless explicitly noted.
+
+camera:
+  width: 640
+  height: 480
+  color_fps: 30
+  depth_fps: 30
+  depth_scale: 0.001          # RealSense depth units -> meters
+  clip_distance_m: 1.5
+  align_to: color
+  warmup_frames: 30           # frames to skip so AE/AWB settle before first grab
+
+chessboard:
+  pattern_size: [11, 8]       # inner corners (cols, rows) for a 12x9 board
+  square_size_m: 0.025        # edge length of one black square, meters
+
+handeye:
+  method: CALIB_HAND_EYE_PARK # CALIB_HAND_EYE_PARK | CALIB_HAND_EYE_DANIILIDIS
+  min_poses: 15
+  settle_time_s: 1.0
+
+observe:
+  move_speed_pct: 20
+  arrive_timeout_s: 8.0
+
+active_perception:
+  enable: true
+  near_height_m: 0.35         # camera height above object for close-up
+  look_down_tilt_deg: 10.0    # tilt of camera optical axis away from world -z
+  fuse_rough_weight: 0.3
+  fuse_fine_weight: 0.7
+
+perception:
+  conf_threshold: 0.5
+  min_mask_pixels: 400
+  mask_erode_px: 2
+  depth_trunc_m: 1.2
+  statistical_outlier:
+    nb_neighbors: 20
+    std_ratio: 2.0
+  voxel_size_m: 0.002
+  plane_segmentation:
+    distance_threshold_m: 0.006
+    ransac_n: 3
+    num_iterations: 1000
+  icp:
+    enable: false
+    voxel_size_m: 0.003
+    fitness_threshold: 0.6
+    inlier_rmse_threshold_m: 0.005
+
+grasp:
+  approach_direction_world: [0.0, 0.0, -1.0]
+  pre_grasp_offset_m: 0.10
+  lift_height_m: 0.12
+  opening_margin_m: 0.005
+  # How much narrower than the object short axis the gripper closes to
+  # when squeezing. Positive => over-close (produces grip force). If set
+  # to 0 the jaws just touch the object surface and will almost always
+  # slip; 2 mm is a conservative default for rigid items.
+  close_overclose_m: 0.002
+  default_effort_mNm: 1000
+  max_opening_m: 0.070        # PiPER parallel jaw 0..70 mm
+
+place:
+  # Base-frame xyz where picked items are released, and orientation for the
+  # end-effector at release. Tilt/yaw are applied on top of a top-down frame
+  # via camera_look_down_rotation, independently of the grasp orientation.
+  xyz_m: [0.30, -0.15, 0.18]
+  tilt_deg: 0.0
+  yaw_deg: 0.0
+
+motion:
+  # Cartesian arrival tolerances used by wait_cartesian_arrive.
+  pos_tol_m: 0.003
+  ang_tol_deg: 1.0
+  cartesian_timeout_s: 8.0
+
+piper:
+  can_port: can0
+  joint_move_speed_pct: 30
+  cartesian_move_speed_pct: 20
+  default_effort_mNm: 1000
+
+paths:
+  intrinsics: configs/camera_intrinsics.npz
+  t_eef_cam: configs/T_eef_cam.npy
+  observe_joints: configs/observe_joints.npy
+  dataset: datasets/my_first_project_v3i_yolov8/data.yaml
+  model: models/best.pt
+  classes: configs/classes.yaml
