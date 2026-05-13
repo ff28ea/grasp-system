@@ -72,8 +72,10 @@ def _safe_cross_basis(y_raw: np.ndarray, z_grasp: np.ndarray) -> np.ndarray:
 
     ``y_raw`` is projected to be orthogonal to ``z_grasp`` before building the
     frame. Raises ``ValueError`` if the two are near-parallel.
+
+    Assumes ``z_grasp`` is already unit-length; skips redundant normalization.
     """
-    z = z_grasp / (np.linalg.norm(z_grasp) + 1e-12)
+    z = z_grasp
     y = y_raw - (y_raw @ z) * z
     ny = np.linalg.norm(y)
     if ny < 1e-6:

@@ -132,15 +132,14 @@ class SegmentationDetector:
         sy = H_tgt / float(H_img)
 
         for m, xyxy, cid, score in zip(masks, boxes, classes, scores):
-            mask_bool = m.astype(bool)
-            if mask_bool.shape != (H_tgt, W_tgt):
+            if m.shape != (H_tgt, W_tgt):
                 mask_resized = cv2.resize(
                     m.astype(np.uint8),
                     (W_tgt, H_tgt),
                     interpolation=cv2.INTER_NEAREST,
                 ).astype(bool)
             else:
-                mask_resized = mask_bool
+                mask_resized = m.astype(bool)
 
             # Keep the bbox expressed in the same coordinate system as
             # the mask. Without this, any consumer that uses both

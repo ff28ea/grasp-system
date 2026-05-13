@@ -20,6 +20,7 @@ and the place pose for your exact workspace.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import logging
 import time
 from pathlib import Path
@@ -53,7 +54,7 @@ from .planning.grasp_planner import (
     fuse_poses,
     plan_topdown_grasp,
 )
-from .perception.pose_estimator import refine_with_icp  # noqa: F401 (used conditionally)
+from .perception.pose_estimator import refine_with_icp  # noqa: F401 (lazy; used in _refine_pose_with_icp_if_enabled)
 from .tools.visualize import (
     build_scene_geometries,
     make_detection_overlay,
@@ -170,7 +171,6 @@ def _refine_pose_with_icp_if_enabled(
     # cloud in cam. Compose with the OBB pose to get the refined T_C_O.
     T_C_O_refined = T_delta @ pose_cam.T_C_O
     # Return a shallow copy so we don't mutate the estimator's output.
-    import dataclasses
     return dataclasses.replace(
         pose_cam,
         T_C_O=T_C_O_refined,
@@ -279,6 +279,7 @@ def _perceive_object_in_camera(
         plane_distance_threshold_m=float(plane["distance_threshold_m"]),
         plane_ransac_n=int(plane["ransac_n"]),
         plane_num_iterations=int(plane["num_iterations"]),
+        min_plane_points=int(plane.get("min_points", 300)),
         up_in_cam=up_in_cam,
         plane_normal_tol_deg=float(plane.get("normal_tol_deg", 25.0)),
         radius_outlier_nb_points=int(ro_cfg.get("nb_points", 0)),

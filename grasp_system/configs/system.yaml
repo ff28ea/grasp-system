@@ -68,6 +68,9 @@ perception:
     distance_threshold_m: 0.006
     ransac_n: 3
     num_iterations: 1000
+    # Minimum number of points in the cloud before attempting plane
+    # segmentation. Clouds smaller than this skip plane removal entirely.
+    min_points: 300
     # Max allowed angle (deg) between the RANSAC plane normal and the
     # base-frame +z (expressed in camera coords). Only planes within
     # this tolerance are treated as the support surface and removed;
