@@ -16,8 +16,9 @@ Usage::
 
 Interactive loop:
     1. Teach/jog the arm to a pose where the chessboard is fully visible.
-    2. Press SPACE to record. The script captures the image, solves PnP,
-       and reads the current end-pose from the arm.
+    2. Press SPACE or left-click the preview window to record. The script
+       captures the image, solves PnP, and reads the current end-pose from
+       the arm.
     3. Press ESC to finish; need at least ``--min-poses`` good pairs.
 
 Saves::
@@ -112,11 +113,26 @@ def _collect_poses(
     t_g2b: List[np.ndarray] = []
     R_t2c: List[np.ndarray] = []
     t_t2c: List[np.ndarray] = []
+    window_name = "handeye eye-in-hand"
+    mouse_capture_requested = False
+
+    def _request_capture_on_left_click(
+        event: int,
+        _x: int,
+        _y: int,
+        _flags: int,
+        _param: object,
+    ) -> None:
+        nonlocal mouse_capture_requested
+        if event == cv2.EVENT_LBUTTONDOWN:
+            mouse_capture_requested = True
 
     piper_port = cfg.get("piper", {}).get("can_port", "can0")
     with RealSenseCamera() as cam, PiperController(can_port=piper_port) as piper:
+        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+        cv2.setMouseCallback(window_name, _request_capture_on_left_click)
         log.info(
-            "move arm to a new calibration pose; SPACE to capture, ESC to finish"
+            "move arm to a new calibration pose; SPACE/left-click to capture, ESC to finish"
         )
         while len(R_g2b) < num_poses:
             color, _ = cam.grab_aligned()
@@ -130,18 +146,21 @@ def _collect_poses(
                 cv2.drawFrameAxes(vis, K, dist, rvec, t_CT, square * 3.0)
             cv2.putText(
                 vis,
-                f"captured {len(R_g2b)}/{num_poses}  {status}",
+                f"captured {len(R_g2b)}/{num_poses}  {status}  SPACE/click=capture",
                 (10, 30),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.8,
+                0.65,
                 color_txt,
                 2,
             )
-            cv2.imshow("handeye eye-in-hand", vis)
+            cv2.imshow(window_name, vis)
             key = cv2.waitKey(1) & 0xFF
+            clicked = mouse_capture_requested
+            mouse_capture_requested = False
             if key == 27:
                 break
-            if key != 32:
+            wants_capture = key == 32 or clicked
+            if not wants_capture:
                 continue
 
             if not ok:
