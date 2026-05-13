@@ -1,0 +1,14 @@
+path: .
+train: train/images
+val: valid/images
+test: test/images
+
+nc: 4
+names: ['BuildingBlocks', 'bottle', 'can', 'cup']
+
+roboflow:
+  workspace: toms-workspace-szc2e
+  project: my-first-project-hivbf
+  version: 3
+  license: Private
+  url: https://app.roboflow.com/toms-workspace-szc2e/my-first-project-hivbf/3
