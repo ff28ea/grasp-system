@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import math
 import time
+from collections import deque
 from dataclasses import dataclass
 from typing import Literal, Optional, Sequence
 
@@ -726,13 +727,15 @@ class PiperController:
         """
         msg = self.raw.GetArmGripperMsgs().gripper_state
         # Newer SDK uses ``grippers_angle``; older versions use
-        # ``gripper_angle``. Try both without re-fetching the message.
-        raw_pos = float(
-            getattr(msg, "grippers_angle", None)
-            if hasattr(msg, "grippers_angle")
-            else getattr(msg, "gripper_angle", 0.0)
-        )
-        opening_m = raw_pos / _MM_TO_PIPER_GRIP / 1000.0
+        # ``gripper_angle``. ``getattr(..., default)`` still returns the
+        # attribute when it exists but is ``None``, which would then
+        # crash ``float()``; fall through explicitly in that case.
+        raw_pos = getattr(msg, "grippers_angle", None)
+        if raw_pos is None:
+            raw_pos = getattr(msg, "gripper_angle", 0.0)
+        if raw_pos is None:
+            raw_pos = 0.0
+        opening_m = float(raw_pos) / _MM_TO_PIPER_GRIP / 1000.0
         return max(0.0, opening_m)
 
     def get_gripper_effort_mNm(self) -> float:
@@ -774,7 +777,13 @@ class PiperController:
             target * 1000.0, effort_mNm=effort_mNm, enable=True
         )
 
-        history: list[tuple[float, float]] = []
+        # Ring buffer of (timestamp, opening_m) samples covering the
+        # trailing ``stall_window_s`` of readings. We only need
+        # min/max over this window to decide "jaws stopped moving",
+        # and the window at 20 Hz poll * 0.25 s holds <10 entries, so
+        # scanning it on each poll stays O(1) amortised while keeping
+        # memory bounded for long timeouts.
+        history: deque[tuple[float, float]] = deque()
         t0 = time.time()
         final = target
         while time.time() - t0 < timeout_s:
@@ -788,14 +797,18 @@ class PiperController:
                 return True, cur
             # Success 2: stalled -- jaws are no longer moving, probably
             # because they have clamped on an object wider than
-            # ``target``. Walk back through history to find the
-            # earliest sample still within the stall window.
+            # ``target``. Drop samples older than the stall window and
+            # check min/max over what remains; require at least one
+            # full window of elapsed time since the close started so
+            # we don't mis-fire on the very first couple of samples.
             cutoff = now - stall_window_s
-            window_vals = [v for (t, v) in history if t >= cutoff]
+            while history and history[0][0] < cutoff:
+                history.popleft()
             if (
-                now - history[0][0] >= stall_window_s
-                and len(window_vals) >= 2
-                and (max(window_vals) - min(window_vals)) <= stall_eps_m
+                now - t0 >= stall_window_s
+                and len(history) >= 2
+                and (max(v for _, v in history) - min(v for _, v in history))
+                <= stall_eps_m
             ):
                 return True, cur
         return False, final

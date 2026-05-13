@@ -63,10 +63,18 @@ class RealSenseCamera:
     the shadow edge of an object picks up background range, so mask +
     depth back-projection produces points that are 5-20 cm behind the
     real object. The official RealSense recommendation is to chain
-    spatial + temporal filters on the depth frame *before* alignment
-    and masking. We expose each filter as a constructor flag so the
-    caller can opt in from yaml without pulling pyrealsense2 into
-    every call site.
+    spatial + temporal filters on the depth frame to reduce these.
+    We expose each filter as a constructor flag so the caller can opt
+    in from yaml without pulling pyrealsense2 into every call site.
+
+    Note on filter ordering
+    ~~~~~~~~~~~~~~~~~~~~~~~
+    Intel recommends filtering *before* alignment, but pyrealsense2
+    does not expose a supported way to reinject a filtered depth frame
+    back into a composite frameset, so :meth:`grab_aligned` aligns
+    first and then applies the filter chain to the aligned depth
+    frame. Empirically this recovers the vast majority of the denoise
+    benefit without requiring a software_device detour.
 
     The filters run only when pyrealsense2 reports them available (they
     are part of the post_processing module, which is present in every
