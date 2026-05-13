@@ -420,9 +420,9 @@ def _snapshot_T_B_O(
                 T_B_E = piper.get_end_pose_matrix()
                 up_in_cam = _up_direction_in_cam(T_B_E, T_E_C)
             else:
+                # Out of retries; re-raise the last failure so the
+                # pipeline's outer try/except can trigger safe retreat.
                 raise
-    else:  # pragma: no cover - defensive
-        raise RuntimeError(f"perception failed after retries: {last_exc}")
 
     # Optional ICP refinement when the class has a template point cloud.
     # No-op when perception.icp.enable is false (the default), so this
@@ -520,6 +520,8 @@ def _execute_grasp(
     grasp: GraspCandidate,
     place_pose_base: Optional[np.ndarray],
     log,
+    *,
+    close_effort_mNm: Optional[float] = None,
 ) -> None:
     # Re-check CAN health at the start of the motion phase. The rough
     # + fine perception easily takes 10-30 s, during which the bus
@@ -537,7 +539,13 @@ def _execute_grasp(
     g_cfg = cfg["grasp"]
     speed_cart = int(cfg["piper"]["cartesian_move_speed_pct"])
     effort_mNm = float(cfg["piper"]["default_effort_mNm"])
-    close_effort_mNm = float(g_cfg.get("close_effort_mNm", effort_mNm))
+    # ``close_effort_mNm`` may be overridden per-class by the caller
+    # (classes.yaml -> <class>.close_effort_mNm). Fall back through
+    # the global grasp block and finally the generic piper effort.
+    if close_effort_mNm is None:
+        close_effort_mNm = float(g_cfg.get("close_effort_mNm", effort_mNm))
+    else:
+        close_effort_mNm = float(close_effort_mNm)
 
     # Read cartesian arrival tolerances from [motion] so they are tunable
     # from system.yaml rather than scattered hard-coded values.
@@ -1110,6 +1118,12 @@ def _run_pipeline(
     close_overclose_m = float(
         cinfo.get("close_overclose_mm", global_overclose * 1000.0)
     ) / 1000.0
+    # Per-class close torque override. Falls through to
+    # grasp.close_effort_mNm inside _execute_grasp when not set.
+    class_close_effort = cinfo.get("close_effort_mNm")
+    close_effort_mNm: Optional[float] = (
+        float(class_close_effort) if class_close_effort is not None else None
+    )
 
     grasp = plan_topdown_grasp(
         T_B_O=T_B_O_final,
@@ -1161,7 +1175,10 @@ def _run_pipeline(
         log.info("dry-run; skipping motion")
         return
 
-    _execute_grasp(piper, cfg, grasp, place_pose_base=place, log=log)
+    _execute_grasp(
+        piper, cfg, grasp, place_pose_base=place, log=log,
+        close_effort_mNm=close_effort_mNm,
+    )
 
     # 6) Always open gripper + lift before going home, so a stray
     # object (or a partially-succeeded place) doesn't get dragged
