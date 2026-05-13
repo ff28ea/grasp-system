@@ -21,8 +21,8 @@ handeye:
   settle_time_s: 1.0
 
 observe:
-  move_speed_pct: 20
-  arrive_timeout_s: 8.0
+  move_speed_pct: 50
+  arrive_timeout_s: 20.0
 
 active_perception:
   enable: true

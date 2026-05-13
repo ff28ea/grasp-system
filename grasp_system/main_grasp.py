@@ -132,7 +132,11 @@ def _perceive_object_in_camera(
 # ---------------------------------------------------------------------------
 # Motion helpers
 # ---------------------------------------------------------------------------
-def _go_to_observe(piper: PiperController, cfg: dict, log) -> None:
+def _go_to_observe(
+    piper: PiperController,
+    cfg: dict,
+    log,
+) -> None:
     joints_path = project_path(cfg["paths"]["observe_joints"])
     if not Path(joints_path).exists():
         raise FileNotFoundError(
@@ -141,10 +145,26 @@ def _go_to_observe(piper: PiperController, cfg: dict, log) -> None:
     joints = load_npy(joints_path)
     speed = int(cfg["observe"]["move_speed_pct"])
     log.info("moving to observe pose (joints rad=%s)", np.array2string(joints, precision=3))
-    piper.joint_ctrl_rad(joints, speed_pct=speed)
     timeout = float(cfg["observe"]["arrive_timeout_s"])
-    if not piper.wait_joints_arrive(joints, tol_deg=1.0, timeout_s=timeout):
-        log.warning("observe-pose arrival timeout; continuing anyway")
+    if not piper.move_joints_rad(
+        joints,
+        speed_pct=speed,
+        tol_deg=1.0,
+        timeout_s=timeout,
+    ):
+        current = piper.get_joints_rad()
+        log.error(
+            "observe-pose arrival timeout; current joints (deg): %s",
+            np.array2string(np.rad2deg(current), precision=3),
+        )
+        log.error(
+            "remaining joint error (deg): %s",
+            np.array2string(np.rad2deg(joints - current), precision=3),
+        )
+        raise RuntimeError(
+            "observe pose was not reached; aborting before perception. "
+            "Use `python -m grasp_system.tools.test_observe_pose` to diagnose motion."
+        )
     time.sleep(0.5)
 
 
@@ -381,6 +401,9 @@ def main() -> None:
         depth_scale=float(cfg["camera"]["depth_scale"]),
         warmup_frames=int(cfg["camera"].get("warmup_frames", 30)),
     ) as cam, PiperController(can_port=can_port) as piper:
+        # Keep the arm enabled after the process exits. Disabling all joints
+        # at shutdown is surprising during bring-up and can make the arm sag.
+        piper.disable_on_disconnect = False
 
         # Sanity-check calibration vs. runtime stream.
         rs_intr = cam.intrinsics

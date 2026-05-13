@@ -16,10 +16,10 @@ Key PiPER quirks handled here:
 Safety note:
   * ``MotionCtrl_1(0x02, 0, 0)`` (a.k.a. ``ResetPiper`` in the SDK) cuts
     power on every joint -- the arm will physically drop. It is NOT a
-    "clear errors" command. Use :meth:`PiperController.reset_and_drop`
-    only when that behaviour is exactly what you want, and call
-    :meth:`PiperController.recover_errors` (disable + re-enable) to clear
-    a driver error latch while the arm stays powered.
+    "clear errors" command.
+  * ``DisableArm(7)`` also removes holding torque. Do not call
+    :meth:`PiperController.recover_errors` unless the arm is supported and
+    a deliberate driver-error recovery is required.
 """
 from __future__ import annotations
 
@@ -51,6 +51,7 @@ _MM_TO_PIPER_GRIP = 1.0e3   # mm -> 0.001 mm
 # Note: the gripper effort unit accepted by GripperCtrl is already
 # 0.001 N*m (milli-N*m). Callers pass ``effort_mNm`` through directly,
 # so there is no N*m->PiPER conversion factor here.
+_UI_RAD_TO_PIPER_ANG = 57324.840764
 
 # ---- Move modes -------------------------------------------------------
 MOVE_P = 0x00
@@ -58,6 +59,19 @@ MOVE_J = 0x01
 MOVE_L = 0x02
 MOVE_C = 0x03
 MOVE_M = 0x04
+
+_JOINT_LIMITS_RAD = np.asarray(
+    [
+        [-2.618, 2.618],
+        [0.0, 3.14],
+        [-2.697, 0.0],
+        [-1.832, 1.832],
+        [-1.22, 1.22],
+        [-2.0944, 2.0944],
+    ],
+    dtype=np.float64,
+)
+_JOINT_NAMES = ("J1", "J2", "J3", "J4", "J5", "J6")
 
 
 @dataclass
@@ -96,6 +110,7 @@ class PiperController:
             )
         self.can_port = can_port
         self.enable_on_connect = enable_on_connect
+        self.disable_on_disconnect = True
         self._piper: Optional[C_PiperInterface_V2] = None
         self._log = get_logger("piper")
 
@@ -105,26 +120,28 @@ class PiperController:
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
-        self.disconnect()
+        self.disconnect(disable_arm=self.disable_on_disconnect)
 
     def connect(self) -> None:
         # C_PiperInterface_V2 is a singleton per can_name: repeated __init__
         # returns the same instance. Re-calling ConnectPort on an already
         # connected instance is harmless (it early-returns under the lock).
-        self._piper = C_PiperInterface_V2(self.can_port)
+        self._piper = C_PiperInterface_V2(self.can_port, False)
         self._piper.ConnectPort()
+        self._piper.ConnectPort(True)
         # Give the reader thread a moment to populate feedback buffers.
         time.sleep(0.05)
         if self.enable_on_connect:
             self.enable_arm()
 
-    def disconnect(self) -> None:
+    def disconnect(self, disable_arm: bool = True) -> None:
         if self._piper is None:
             return
-        try:
-            self.disable_arm()
-        except Exception:
-            pass
+        if disable_arm:
+            try:
+                self.disable_arm()
+            except Exception:
+                pass
         # Properly tear down the CAN reader thread and close socketcan.
         # Without this the daemon thread stays alive and the port remains
         # bound, making a subsequent reconnect flaky.
@@ -156,15 +173,16 @@ class PiperController:
         t0 = time.time()
         last_states: Sequence[bool] = []
         while time.time() - t0 < timeout_s:
-            # EnablePiper() is the canonical SDK helper: it sends EnableArm(7)
-            # and returns True iff every motor already reports enabled.
-            if piper.EnablePiper():
+            # Match Piper_sdk_ui: explicitly enable all joints and the gripper,
+            # then read the low-speed driver flags instead of relying on helper
+            # behavior that has varied across SDK versions.
+            piper.EnableArm(7)
+            piper.GripperCtrl(0, 1000, 0x01, 0)
+            last_states = self.get_arm_enable_status()
+            if all(last_states):
+                time.sleep(0.1)
                 self._log.info("arm enabled")
                 return
-            try:
-                last_states = piper.GetArmEnableStatus()
-            except Exception:
-                last_states = []
             time.sleep(0.05)
         raise RuntimeError(
             f"arm enable timeout after {timeout_s:.1f}s; last motor states={list(last_states)}. "
@@ -175,13 +193,13 @@ class PiperController:
         self.raw.DisableArm(7)
 
     def recover_errors(self) -> None:
-        """Clear a latched driver-error state without dropping the arm.
+        """Clear a latched driver-error state by disabling and re-enabling.
 
-        Implemented as ``DisableArm(7)`` followed by a re-enable. This is
-        the safe alternative to ``MotionCtrl_1(0x02, 0, 0)`` (which cuts
-        motor power).
+        This removes holding torque while disabled. Only use it when the arm
+        is supported and a deliberate driver-error recovery is required.
         """
         self.raw.DisableArm(7)
+        self.raw.GripperCtrl(0, 1000, 0x02, 0)
         time.sleep(0.05)
         self.enable_arm()
 
@@ -199,12 +217,13 @@ class PiperController:
     # -- motion-mode helpers -------------------------------------------
     def _set_mode(self, move_mode: int, speed_pct: int) -> None:
         speed_pct = int(max(0, min(100, speed_pct)))
-        self.raw.MotionCtrl_2(0x01, int(move_mode), speed_pct)
+        self.raw.MotionCtrl_2(0x01, int(move_mode), speed_pct, 0x00)
 
     # -- joint control --------------------------------------------------
     def joint_ctrl_rad(self, joints_rad: Sequence[float], speed_pct: int = 30) -> None:
         if len(joints_rad) != 6:
             raise ValueError("joints_rad must have exactly 6 elements")
+        self.validate_joints_rad(joints_rad)
         self._set_mode(MOVE_J, speed_pct)
         vals = [round(float(j) * _RAD_TO_PIPER_ANG) for j in joints_rad]
         self.raw.JointCtrl(*vals)
@@ -212,9 +231,63 @@ class PiperController:
     def joint_ctrl_deg(self, joints_deg: Sequence[float], speed_pct: int = 30) -> None:
         if len(joints_deg) != 6:
             raise ValueError("joints_deg must have exactly 6 elements")
+        self.validate_joints_rad(np.deg2rad(np.asarray(joints_deg, dtype=np.float64)))
         self._set_mode(MOVE_J, speed_pct)
         vals = [round(float(j) * _DEG_TO_PIPER_ANG) for j in joints_deg]
         self.raw.JointCtrl(*vals)
+
+    def move_joints_rad(
+        self,
+        joints_rad: Sequence[float],
+        speed_pct: int = 30,
+        tol_deg: float = 0.5,
+        timeout_s: float = 10.0,
+        command_period_s: float = 0.005,
+    ) -> bool:
+        """Move to a joint target, repeating commands until arrival/timeout."""
+        self.validate_joints_rad(joints_rad)
+        target_rad = np.asarray(joints_rad, dtype=np.float64)
+        # Piper_sdk_ui/scripts/joint_control_window.py uses this factor.
+        target_units = [round(float(j) * _UI_RAD_TO_PIPER_ANG) for j in target_rad]
+        target_deg = np.rad2deg(target_rad)
+        speed_pct = int(max(0, min(100, speed_pct)))
+        command_speed = 50 if speed_pct <= 0 else speed_pct
+
+        t0 = time.time()
+        while time.time() - t0 < timeout_s:
+            self.raw.MotionCtrl_2(0x01, MOVE_J, command_speed, 0x00)
+            self.raw.JointCtrl(*target_units)
+            cur = self.get_joints_deg()
+            if np.max(np.abs(_wrap_deg(cur - target_deg))) <= tol_deg:
+                return True
+            time.sleep(command_period_s)
+        return False
+
+    def validate_joints_rad(self, joints_rad: Sequence[float]) -> None:
+        joints = np.asarray(joints_rad, dtype=np.float64)
+        if joints.shape != (6,):
+            raise ValueError(f"expected 6 joint angles, got shape {joints.shape}")
+        if not np.all(np.isfinite(joints)):
+            raise ValueError("joint target contains NaN or Inf")
+
+        eps = 1e-6
+        below = joints < (_JOINT_LIMITS_RAD[:, 0] - eps)
+        above = joints > (_JOINT_LIMITS_RAD[:, 1] + eps)
+        bad = np.where(below | above)[0]
+        if bad.size == 0:
+            return
+
+        joints_deg = np.rad2deg(joints)
+        limits_deg = np.rad2deg(_JOINT_LIMITS_RAD)
+        details = ", ".join(
+            f"{_JOINT_NAMES[i]}={joints_deg[i]:.3f} deg "
+            f"outside [{limits_deg[i, 0]:.3f}, {limits_deg[i, 1]:.3f}] deg"
+            for i in bad
+        )
+        raise ValueError(
+            "joint target is outside the Piper UI joint limits: "
+            f"{details}. Re-teach the observe pose inside these limits."
+        )
 
     def get_joints_rad(self) -> np.ndarray:
         msg = self.raw.GetArmJointMsgs().joint_state
@@ -244,6 +317,17 @@ class PiperController:
             ],
             dtype=np.float64,
         ) / _DEG_TO_PIPER_ANG
+
+    def get_arm_enable_status(self) -> list[bool]:
+        low_spd = self.raw.GetArmLowSpdInfoMsgs()
+        return [
+            bool(low_spd.motor_1.foc_status.driver_enable_status),
+            bool(low_spd.motor_2.foc_status.driver_enable_status),
+            bool(low_spd.motor_3.foc_status.driver_enable_status),
+            bool(low_spd.motor_4.foc_status.driver_enable_status),
+            bool(low_spd.motor_5.foc_status.driver_enable_status),
+            bool(low_spd.motor_6.foc_status.driver_enable_status),
+        ]
 
     # -- cartesian end-pose control ------------------------------------
     def end_pose_ctrl(
