@@ -334,7 +334,7 @@ def rescale_intrinsics(
     K_out[1, 1] *= sy       # fy
     K_out[0, 2] *= sx       # cx
     K_out[1, 2] *= sy       # cy
-    # Off-diagonal skew (K[0, 1]) stays the same *in pixel units* under
-    # anisotropic scaling only when sx == sy; for safety scale it too.
+    # Off-diagonal skew (K[0, 1]) has units of pixels and scales with
+    # the x-axis resolution ratio, regardless of whether sx == sy.
     K_out[0, 1] *= sx
     return K_out
