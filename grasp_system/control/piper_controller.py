@@ -569,6 +569,61 @@ class PiperController:
             round(pose.rz_deg * _DEG_TO_PIPER_ANG),
         )
 
+    def move_to_pose(
+        self,
+        pose: EndPose | np.ndarray,
+        linear: bool = False,
+        speed_pct: int = 20,
+        pos_tol_m: float = 0.003,
+        ang_tol_deg: float = 1.0,
+        timeout_s: float = 8.0,
+        command_period_s: float = 0.02,
+    ) -> bool:
+        """Command a cartesian target and keep re-sending it until arrival.
+
+        ``end_pose_ctrl`` is a single-shot write: one dropped CAN frame
+        or an intervening mode switch can leave the arm "not moving".
+        This helper mirrors :meth:`move_joints_rad` by repeating the
+        MotionCtrl_2 + EndPoseCtrl pair at ~50 Hz until the arm actually
+        reaches the pose or the timeout expires. Returns True on
+        arrival, False on timeout.
+        """
+        # Normalise to matrix form once (avoid recomputing Euler every loop).
+        if isinstance(pose, np.ndarray):
+            T_target = np.asarray(pose, dtype=np.float64)
+            if T_target.shape != (4, 4):
+                raise ValueError("pose matrix must be 4x4")
+        else:
+            T_target = pose.as_matrix()
+        x, y, z = T_target[:3, 3]
+        rx, ry, rz = matrix_to_euler_xyz_deg(T_target[:3, :3])
+        cmd = (
+            round(float(x) * _M_TO_PIPER_POS),
+            round(float(y) * _M_TO_PIPER_POS),
+            round(float(z) * _M_TO_PIPER_POS),
+            round(float(rx) * _DEG_TO_PIPER_ANG),
+            round(float(ry) * _DEG_TO_PIPER_ANG),
+            round(float(rz) * _DEG_TO_PIPER_ANG),
+        )
+        move_mode = MOVE_L if linear else MOVE_P
+        speed_pct = int(max(0, min(100, speed_pct)))
+        command_speed = 20 if speed_pct <= 0 else speed_pct
+
+        R_target = T_target[:3, :3]
+        t_target = T_target[:3, 3]
+        t0 = time.time()
+        while time.time() - t0 < timeout_s:
+            self.raw.MotionCtrl_2(0x01, move_mode, command_speed, 0x00)
+            self.raw.EndPoseCtrl(*cmd)
+            cur = self.get_end_pose_matrix()
+            if (
+                float(np.linalg.norm(cur[:3, 3] - t_target)) <= pos_tol_m
+                and rotation_angle_deg(cur[:3, :3], R_target) <= ang_tol_deg
+            ):
+                return True
+            time.sleep(command_period_s)
+        return False
+
     def get_end_pose(self) -> EndPose:
         msg = self.raw.GetArmEndPoseMsgs().end_pose
         return EndPose(
@@ -654,6 +709,118 @@ class PiperController:
 
     def close_gripper(self, effort_mNm: float = 1000.0) -> None:
         self.set_gripper_opening_mm(0.0, effort_mNm=effort_mNm)
+
+    # -- gripper feedback ---------------------------------------------
+    def get_gripper_opening_m(self) -> float:
+        """Return the current gripper opening in meters.
+
+        Reads :py:meth:`GetArmGripperMsgs` from the SDK. The message
+        carries the gripper position in 0.001 mm (the same unit we
+        write with :py:meth:`GripperCtrl`), so we convert back to
+        meters here. Negative values (can happen briefly during zero
+        calibration) are clamped to 0 so callers don't have to.
+        """
+        try:
+            msg = self.raw.GetArmGripperMsgs().gripper_state
+            raw_pos = float(msg.grippers_angle)
+        except AttributeError:
+            # Older SDK exposes ``grippers_angle`` under a slightly
+            # different name -- fall back rather than crashing a
+            # running pipeline.
+            msg = self.raw.GetArmGripperMsgs().gripper_state
+            raw_pos = float(getattr(msg, "gripper_angle", 0.0))
+        opening_m = raw_pos / _MM_TO_PIPER_GRIP / 1000.0
+        return max(0.0, opening_m)
+
+    def get_gripper_effort_mNm(self) -> float:
+        """Return the current gripper torque reading in mN*m.
+
+        Useful for detecting that the jaws have actually clamped on
+        something (as opposed to closing into empty air).
+        """
+        msg = self.raw.GetArmGripperMsgs().gripper_state
+        return float(getattr(msg, "grippers_effort", 0.0))
+
+    def close_until(
+        self,
+        target_opening_m: float = 0.0,
+        effort_mNm: float = 1000.0,
+        tol_m: float = 0.0015,
+        timeout_s: float = 2.0,
+        poll_s: float = 0.05,
+        stall_window_s: float = 0.25,
+        stall_eps_m: float = 0.0003,
+    ) -> tuple[bool, float]:
+        """Close the gripper towards ``target_opening_m`` with feedback.
+
+        Sends a GripperCtrl command once, then polls
+        :py:meth:`get_gripper_opening_m` until one of:
+
+        * the current opening is within ``tol_m`` of ``target_opening_m``
+          (success, reached commanded position);
+        * the opening stops changing by more than ``stall_eps_m`` over
+          ``stall_window_s`` (success, jaws clamped on an object);
+        * ``timeout_s`` expires (failure).
+
+        Returns ``(reached_or_stalled, final_opening_m)``. Callers
+        typically compare ``final_opening_m`` against the expected
+        object width to decide whether the grip is good.
+        """
+        target = max(0.0, float(target_opening_m))
+        self.set_gripper_opening_mm(
+            target * 1000.0, effort_mNm=effort_mNm, enable=True
+        )
+
+        history: list[tuple[float, float]] = []
+        t0 = time.time()
+        final = target
+        while time.time() - t0 < timeout_s:
+            time.sleep(poll_s)
+            cur = self.get_gripper_opening_m()
+            final = cur
+            now = time.time()
+            history.append((now, cur))
+            # Success 1: reached the commanded opening.
+            if abs(cur - target) <= tol_m:
+                return True, cur
+            # Success 2: stalled -- jaws are no longer moving, probably
+            # because they have clamped on an object wider than
+            # ``target``. Walk back through history to find the
+            # earliest sample still within the stall window.
+            cutoff = now - stall_window_s
+            window_vals = [v for (t, v) in history if t >= cutoff]
+            if (
+                now - history[0][0] >= stall_window_s
+                and len(window_vals) >= 2
+                and (max(window_vals) - min(window_vals)) <= stall_eps_m
+            ):
+                return True, cur
+        return False, final
+
+    def check_grasp(
+        self,
+        expected_width_m: float,
+        min_width_m: float = 0.003,
+        tol_m: float = 0.006,
+    ) -> tuple[bool, float]:
+        """Heuristic post-close check: are we actually holding something?
+
+        Reads the current gripper opening and compares against the
+        object's expected short-axis width. Returns ``(ok, opening_m)``.
+
+        * ``ok`` is False if the jaws closed below ``min_width_m`` --
+          they met each other, no object in between.
+        * ``ok`` is False if the jaws are more than ``tol_m`` away
+          from ``expected_width_m`` in either direction -- the object
+          either slipped or was a completely different size than
+          perception estimated.
+        """
+        opening = self.get_gripper_opening_m()
+        if opening < min_width_m:
+            return False, opening
+        if abs(opening - expected_width_m) > tol_m:
+            return False, opening
+        return True, opening
 
     def gripper_clear_errors(self) -> None:
         """Clear gripper-only latched faults (equivalent to the UI

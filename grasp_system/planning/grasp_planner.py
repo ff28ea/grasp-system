@@ -19,6 +19,13 @@ from typing import Optional, Sequence, Tuple
 
 import numpy as np
 
+try:
+    from scipy.optimize import linear_sum_assignment
+except ImportError:  # pragma: no cover - scipy is in requirements.txt
+    linear_sum_assignment = None  # type: ignore[assignment]
+
+from ..common import matrix_to_euler_xyz_deg
+
 
 @dataclass
 class GraspCandidate:
@@ -90,6 +97,7 @@ def plan_topdown_grasp(
     lift_m: float = 0.12,
     max_opening_m: float = 0.070,
     center_height_offset_m: float = 0.0,
+    workspace: Optional[dict] = None,
 ) -> GraspCandidate:
     """Build a top-down grasp from an OBB-derived object pose.
 
@@ -115,6 +123,21 @@ def plan_topdown_grasp(
     center_height_offset_m:
         Raise or lower the pick point along world z relative to the OBB center.
         Positive values grasp higher on tall objects.
+    workspace:
+        Optional dict with geometry guardrails evaluated on the final
+        grasp point and the pre/lift poses. Accepted keys:
+
+        * ``table_z_m`` (float): absolute z of the support surface.
+        * ``safe_z_min_m`` (float): minimum clearance above
+          ``table_z_m`` that the tool tip must keep. Default 0.005.
+        * ``xy_bounds_m`` (``[[xmin, xmax], [ymin, ymax]]``): reachable
+          rectangle in the base frame.
+        * ``z_max_m`` (float): ceiling (useful when the arm has an
+          enclosure or the camera would hit the lift pose).
+
+        If any check fails, the returned candidate has ``feasible=False``
+        and a human-readable ``reason``; motion callers should refuse
+        to execute it.
     """
     T_B_O = np.asarray(T_B_O, dtype=np.float64)
     R_O = T_B_O[:3, :3]
@@ -152,6 +175,24 @@ def plan_topdown_grasp(
         R_grasp = _safe_cross_basis(R_O[:, alt_idx], z_grasp)
         best_idx = alt_idx
 
+    # The closing axis is symmetric: R_grasp and R_grasp * Rz(180 deg)
+    # describe the *same* parallel-jaw contact pair, but usually imply
+    # wildly different wrist poses at the arm's IK. Prefer the variant
+    # that keeps the wrist "flatter" (smaller |rz| in extrinsic xyz),
+    # since that is empirically more likely to be reachable with a
+    # 6-DoF arm that otherwise has to wrap J6 the long way around.
+    R_flip = R_grasp @ np.array(
+        [
+            [-1.0, 0.0, 0.0],
+            [0.0, -1.0, 0.0],
+            [0.0, 0.0, 1.0],
+        ]
+    )
+    rz_primary = abs(matrix_to_euler_xyz_deg(R_grasp)[2])
+    rz_flipped = abs(matrix_to_euler_xyz_deg(R_flip)[2])
+    if rz_flipped + 1e-3 < rz_primary:
+        R_grasp = R_flip
+
     pick_point = center + np.array([0.0, 0.0, center_height_offset_m])
 
     T_B_grasp = np.eye(4)
@@ -179,7 +220,7 @@ def plan_topdown_grasp(
     else:
         opening = min(opening, float(max_opening_m))
 
-    return GraspCandidate(
+    candidate = GraspCandidate(
         T_B_grasp=T_B_grasp,
         opening_m=opening,
         close_opening_m=close_opening,
@@ -189,6 +230,61 @@ def plan_topdown_grasp(
         feasible=feasible,
         reason=reason,
     )
+
+    if workspace is not None and candidate.feasible:
+        ok, why = _check_workspace(candidate, workspace)
+        if not ok:
+            candidate.feasible = False
+            candidate.reason = why
+
+    return candidate
+
+
+def _check_workspace(candidate: GraspCandidate, workspace: dict) -> Tuple[bool, str]:
+    """Evaluate geometric guardrails against the grasp / pre / lift poses.
+
+    Returns (ok, reason). The reason string is empty on success.
+    """
+    grasp_xyz = candidate.T_B_grasp[:3, 3]
+    pre_xyz = candidate.pre_grasp[:3, 3]
+    lift_xyz = candidate.lift[:3, 3]
+
+    table_z = workspace.get("table_z_m")
+    if table_z is not None:
+        min_clearance = float(workspace.get("safe_z_min_m", 0.005))
+        if float(grasp_xyz[2]) < float(table_z) + min_clearance:
+            return (
+                False,
+                f"grasp z={grasp_xyz[2]*1000:.1f} mm would put tool below "
+                f"table ({float(table_z)*1000:.1f} mm) + clearance "
+                f"{min_clearance*1000:.1f} mm",
+            )
+
+    xy_bounds = workspace.get("xy_bounds_m")
+    if xy_bounds is not None:
+        (xmin, xmax), (ymin, ymax) = xy_bounds
+        for name, xyz in (("grasp", grasp_xyz), ("pre", pre_xyz), ("lift", lift_xyz)):
+            if not (float(xmin) <= float(xyz[0]) <= float(xmax)) or not (
+                float(ymin) <= float(xyz[1]) <= float(ymax)
+            ):
+                return (
+                    False,
+                    f"{name} xy=({xyz[0]*1000:.1f}, {xyz[1]*1000:.1f}) mm "
+                    f"outside workspace x=[{xmin*1000:.0f},{xmax*1000:.0f}] "
+                    f"y=[{ymin*1000:.0f},{ymax*1000:.0f}] mm",
+                )
+
+    z_max = workspace.get("z_max_m")
+    if z_max is not None:
+        for name, xyz in (("pre", pre_xyz), ("lift", lift_xyz), ("grasp", grasp_xyz)):
+            if float(xyz[2]) > float(z_max):
+                return (
+                    False,
+                    f"{name} z={xyz[2]*1000:.1f} mm above workspace ceiling "
+                    f"{float(z_max)*1000:.1f} mm",
+                )
+
+    return True, ""
 
 
 def align_obb_axes(
@@ -224,15 +320,30 @@ def align_obb_axes(
     ext_src = np.asarray(extent_src, dtype=np.float64).reshape(3)
 
     dots = R_ref.T @ R_src  # (3, 3): row i = ref axis i dotted with each src axis
-    remaining = [0, 1, 2]
-    perm = [0, 0, 0]
-    signs = [1.0, 1.0, 1.0]
-    for i in range(3):
-        # best src axis for ref axis i, among those not yet assigned
-        best_j = max(remaining, key=lambda j: abs(dots[i, j]))
-        perm[i] = best_j
-        signs[i] = float(np.sign(dots[i, best_j])) or 1.0
-        remaining.remove(best_j)
+
+    # Optimal assignment instead of greedy: three OBB axes of similar
+    # length can confuse the row-by-row greedy picker (e.g. ref axis 0
+    # wins its best src axis, axis 1 is then forced to its second-best,
+    # axis 2 is stuck with the leftover even if a swap between 1 and 2
+    # would give a strictly better sum of |dots|). Hungarian on
+    # ``-|dots|`` is exact and practically free for a 3x3 cost.
+    if linear_sum_assignment is not None:
+        row_ind, col_ind = linear_sum_assignment(-np.abs(dots))
+        perm = [0, 0, 0]
+        signs = [1.0, 1.0, 1.0]
+        for i, j in zip(row_ind, col_ind):
+            perm[i] = int(j)
+            signs[i] = float(np.sign(dots[i, j])) or 1.0
+    else:
+        # Greedy fallback (only used if scipy is missing).
+        remaining = [0, 1, 2]
+        perm = [0, 0, 0]
+        signs = [1.0, 1.0, 1.0]
+        for i in range(3):
+            best_j = max(remaining, key=lambda j: abs(dots[i, j]))
+            perm[i] = best_j
+            signs[i] = float(np.sign(dots[i, best_j])) or 1.0
+            remaining.remove(best_j)
 
     R_out = R_src[:, perm] * np.asarray(signs).reshape(1, 3)
     if np.linalg.det(R_out) < 0:

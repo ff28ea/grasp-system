@@ -1,6 +1,11 @@
 # Global runtime configuration for the grasp system.
 # All dimensions in SI (meters, radians, seconds) unless explicitly noted.
 
+logging:
+  # Python logging level for the top-level "grasp.*" loggers.
+  # One of DEBUG, INFO, WARNING, ERROR.
+  level: INFO
+
 camera:
   width: 640
   height: 480
@@ -36,6 +41,14 @@ perception:
   min_mask_pixels: 400
   mask_erode_px: 2
   depth_trunc_m: 1.2
+  # Ultralytics device hint. null lets YOLO pick (usually cpu); set to
+  # "cuda:0" / "mps" / "cpu" explicitly to avoid the ~500 ms CPU hit on
+  # the first forward pass.
+  device: null
+  # Number of extra attempts when perception throws a RuntimeError
+  # (no detection, too-sparse cloud, etc). Each retry rereads the
+  # arm pose and recomputes up_in_cam before capturing again.
+  retries: 2
   statistical_outlier:
     nb_neighbors: 20
     std_ratio: 2.0
@@ -44,6 +57,11 @@ perception:
     distance_threshold_m: 0.006
     ransac_n: 3
     num_iterations: 1000
+    # Max allowed angle (deg) between the RANSAC plane normal and the
+    # base-frame +z (expressed in camera coords). Only planes within
+    # this tolerance are treated as the support surface and removed;
+    # the object's own dominant face is preserved.
+    normal_tol_deg: 25.0
   icp:
     enable: false
     voxel_size_m: 0.003
@@ -61,6 +79,23 @@ grasp:
   # slip; 2 mm is a conservative default for rigid items.
   close_overclose_m: 0.002
   default_effort_mNm: 1000
+  # Optional override used only for the closing motion. Lets you squeeze
+  # rigid items harder without also raising the holding torque used when
+  # commanding pre-grasp or place openings. Falls back to
+  # piper.default_effort_mNm when omitted.
+  close_effort_mNm: 1000
+  # Timeout for the feedback-driven close_until loop.
+  close_timeout_s: 2.0
+  # If the gripper opening stops changing by more than this (m) during
+  # a ``stall_window`` (~0.25s) close_until treats that as "clamped on
+  # an object" and returns successfully.
+  close_stall_eps_m: 0.0003
+  # After close_until finishes, the final opening must be within
+  # grasp_check_tol_m of the expected object short axis and not below
+  # grasp_check_min_m; otherwise the pipeline aborts (assumed slip /
+  # miss). Tighten these if you operate on a small range of objects.
+  grasp_check_tol_m: 0.006
+  grasp_check_min_m: 0.003
   max_opening_m: 0.070        # PiPER parallel jaw 0..70 mm
 
 place:
@@ -72,10 +107,33 @@ place:
   yaw_deg: 0.0
 
 motion:
-  # Cartesian arrival tolerances used by wait_cartesian_arrive.
+  # Cartesian arrival tolerances used by PiperController.move_to_pose.
   pos_tol_m: 0.003
   ang_tol_deg: 1.0
   cartesian_timeout_s: 8.0
+  # Minimum CAN receive frame rate (Hz) required before the pipeline
+  # will attempt any motion. PiPER normally runs at ~200 Hz on a
+  # healthy bus. Aborts early instead of sending commands into a
+  # degraded link.
+  min_can_fps: 50.0
+  # Vertical distance to lift before homing in the safe-retreat path.
+  # Ensures the tool clears the workspace before the joint-space move
+  # to the observe pose.
+  retreat_lift_m: 0.08
+
+# Hard geometric guardrails evaluated on every planned grasp. Uncomment
+# and tune for your workspace. Any limit set here short-circuits the
+# motion phase with a human-readable message if violated.
+workspace:
+  # Z of the support surface in the base frame (m).
+  table_z_m: 0.0
+  # Minimum clearance the tool tip must keep above the table.
+  safe_z_min_m: 0.005
+  # Reachable rectangle: [[xmin, xmax], [ymin, ymax]] in m.
+  xy_bounds_m: [[-0.40, 0.40], [-0.40, 0.40]]
+  # Optional ceiling (m) -- useful if a camera rig or enclosure would
+  # collide with the lift pose.
+  z_max_m: 0.60
 
 piper:
   can_port: can0

@@ -20,6 +20,7 @@ and the place pose for your exact workspace.
 from __future__ import annotations
 
 import argparse
+import logging
 import time
 from pathlib import Path
 from typing import Optional
@@ -67,6 +68,48 @@ except ImportError:  # pragma: no cover
 
 
 # ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+def _up_direction_in_cam(T_B_E: np.ndarray, T_E_C: np.ndarray) -> np.ndarray:
+    """Express the base-frame +z axis in camera coordinates.
+
+    Used to disambiguate OBB axis signs and to orient the table-plane
+    removal RANSAC. Rotating world +z into the camera frame requires
+    only the rotation block of ``T_B_C^{-1}``.
+    """
+    T_B_C = T_B_E @ T_E_C
+    R_C_B = T_B_C[:3, :3].T     # cam <- base rotation (orthonormal)
+    return R_C_B @ np.array([0.0, 0.0, 1.0], dtype=np.float64)
+
+
+def _resolve_target_class(
+    arg: Optional[str], classes: dict[int, dict]
+) -> Optional[int]:
+    """Turn a CLI ``--target-class`` value into a class id.
+
+    Accepts either a numeric string (``"2"``) or the class ``name``
+    field as declared in ``configs/classes.yaml``. Case-insensitive for
+    names. Returns None when the caller passed no filter.
+    """
+    if arg is None:
+        return None
+    s = str(arg).strip()
+    if not s:
+        return None
+    if s.lstrip("-").isdigit():
+        return int(s)
+    lookup = {str(v.get("name", "")).lower(): int(k) for k, v in classes.items()}
+    key = s.lower()
+    if key not in lookup:
+        available = ", ".join(sorted(lookup.keys()))
+        raise ValueError(
+            f"unknown --target-class {arg!r}; "
+            f"classes.yaml defines: {available or '<none>'}"
+        )
+    return lookup[key]
+
+
+# ---------------------------------------------------------------------------
 # Perception helpers
 # ---------------------------------------------------------------------------
 def _perceive_object_in_camera(
@@ -77,6 +120,7 @@ def _perceive_object_in_camera(
     log,
     K: Optional[np.ndarray] = None,
     dist: Optional[np.ndarray] = None,
+    up_in_cam: Optional[np.ndarray] = None,
 ):
     p_cfg = cfg["perception"]
     color, depth_raw = cam.grab_aligned()
@@ -121,7 +165,10 @@ def _perceive_object_in_camera(
         dist=dist,
     )
     if len(pcd_raw.points) < 50:
-        raise RuntimeError("mask produced too few 3D points")
+        raise RuntimeError(
+            f"mask produced too few 3D points ({len(pcd_raw.points)}); "
+            "check lighting / depth_trunc_m"
+        )
 
     so = p_cfg["statistical_outlier"]
     plane = p_cfg["plane_segmentation"]
@@ -134,11 +181,16 @@ def _perceive_object_in_camera(
         plane_distance_threshold_m=float(plane["distance_threshold_m"]),
         plane_ransac_n=int(plane["ransac_n"]),
         plane_num_iterations=int(plane["num_iterations"]),
+        up_in_cam=up_in_cam,
+        plane_normal_tol_deg=float(plane.get("normal_tol_deg", 25.0)),
     )
     if len(pcd.points) < 20:
-        raise RuntimeError("cleaned point cloud too sparse")
+        raise RuntimeError(
+            f"cleaned point cloud too sparse ({len(pcd.points)}); "
+            "consider lowering mask_erode_px or disabling plane removal"
+        )
 
-    pose = estimate_pose_from_obb(pcd)
+    pose = estimate_pose_from_obb(pcd, up_world_in_cam=up_in_cam)
     # Return the raw color image and the cleaned point cloud alongside the
     # pose so downstream visualization has access to the same data the
     # estimator used. Cheap: both are already in memory.
@@ -184,6 +236,47 @@ def _go_to_observe(
     time.sleep(0.5)
 
 
+def _safe_retreat(
+    piper: PiperController,
+    cfg: dict,
+    log,
+) -> None:
+    """Open the gripper and lift straight up before homing.
+
+    Called in the ``finally`` clause so that, regardless of where the
+    pipeline failed, the arm ends up in a safe state: no object
+    clamped in the jaws, and the tool tip well above the table before
+    we start a joint-space motion to the observe pose (joint paths
+    don't respect cartesian obstacles).
+    """
+    try:
+        piper.open_gripper(
+            opening_m=float(cfg["grasp"]["max_opening_m"]),
+            effort_mNm=float(cfg["piper"]["default_effort_mNm"]),
+        )
+    except Exception as exc:
+        log.warning("safe_retreat: open_gripper failed (%s)", exc)
+
+    retreat_dz = float(cfg.get("motion", {}).get("retreat_lift_m", 0.08))
+    if retreat_dz <= 0.0:
+        return
+    try:
+        cur = piper.get_end_pose_matrix()
+        target = cur.copy()
+        target[2, 3] += retreat_dz
+        m_cfg = cfg.get("motion", {})
+        piper.move_to_pose(
+            target,
+            linear=True,
+            speed_pct=max(5, int(cfg["piper"]["cartesian_move_speed_pct"]) // 2),
+            pos_tol_m=float(m_cfg.get("pos_tol_m", 0.003)),
+            ang_tol_deg=float(m_cfg.get("ang_tol_deg", 1.0)),
+            timeout_s=float(m_cfg.get("cartesian_timeout_s", 8.0)),
+        )
+    except Exception as exc:
+        log.warning("safe_retreat: vertical lift failed (%s)", exc)
+
+
 def _snapshot_T_B_O(
     piper: PiperController,
     cam: RealSenseCamera,
@@ -194,13 +287,37 @@ def _snapshot_T_B_O(
     log,
     K: Optional[np.ndarray] = None,
     dist: Optional[np.ndarray] = None,
+    retries: int = 2,
+    retry_delay_s: float = 0.3,
 ):
     # Ensure arm is fully settled so the end-pose feedback matches the frame.
     time.sleep(float(cfg["handeye"].get("settle_time_s", 1.0)) * 0.5)
     T_B_E = piper.get_end_pose_matrix()
-    det, pose_cam, color, pcd_cam = _perceive_object_in_camera(
-        cam, detector, cfg, target_class, log, K=K, dist=dist
-    )
+    up_in_cam = _up_direction_in_cam(T_B_E, T_E_C)
+
+    last_exc: Optional[Exception] = None
+    for attempt in range(max(1, int(retries) + 1)):
+        try:
+            det, pose_cam, color, pcd_cam = _perceive_object_in_camera(
+                cam, detector, cfg, target_class, log,
+                K=K, dist=dist, up_in_cam=up_in_cam,
+            )
+            break
+        except RuntimeError as exc:
+            last_exc = exc
+            if attempt < retries:
+                log.warning(
+                    "perception attempt %d/%d failed (%s); retrying in %.2fs",
+                    attempt + 1, retries + 1, exc, retry_delay_s,
+                )
+                time.sleep(retry_delay_s)
+                T_B_E = piper.get_end_pose_matrix()
+                up_in_cam = _up_direction_in_cam(T_B_E, T_E_C)
+            else:
+                raise
+    else:  # pragma: no cover - defensive
+        raise RuntimeError(f"perception failed after retries: {last_exc}")
+
     T_B_O = T_B_E @ T_E_C @ pose_cam.T_C_O
     return det, pose_cam, T_B_E, T_B_O, color, pcd_cam
 
@@ -260,10 +377,20 @@ def _active_perception_close_up(
     pos_tol = float(m_cfg.get("pos_tol_m", 0.003))
     ang_tol = float(m_cfg.get("ang_tol_deg", 1.0))
     cart_timeout = float(m_cfg.get("cartesian_timeout_s", 8.0))
-    piper.end_pose_ctrl(T_B_E_near, linear=False, speed_pct=speed)
-    piper.wait_cartesian_arrive(
-        T_B_E_near, pos_tol_m=pos_tol, ang_tol_deg=ang_tol, timeout_s=cart_timeout
-    )
+    # move_to_pose repeats EndPoseCtrl @ 50 Hz until arrival/timeout --
+    # crucial for CAN reliability on the PiPER (a lone EndPoseCtrl
+    # frame can silently get dropped during a mode switch).
+    if not piper.move_to_pose(
+        T_B_E_near,
+        linear=False,
+        speed_pct=speed,
+        pos_tol_m=pos_tol,
+        ang_tol_deg=ang_tol,
+        timeout_s=cart_timeout,
+    ):
+        raise RuntimeError(
+            "close-up pose was not reached within timeout; aborting active perception"
+        )
     time.sleep(0.4)
 
     return _snapshot_T_B_O(
@@ -281,6 +408,7 @@ def _execute_grasp(
     g_cfg = cfg["grasp"]
     speed_cart = int(cfg["piper"]["cartesian_move_speed_pct"])
     effort_mNm = float(cfg["piper"]["default_effort_mNm"])
+    close_effort_mNm = float(g_cfg.get("close_effort_mNm", effort_mNm))
 
     # Read cartesian arrival tolerances from [motion] so they are tunable
     # from system.yaml rather than scattered hard-coded values.
@@ -289,6 +417,36 @@ def _execute_grasp(
     ang_tol = float(m_cfg.get("ang_tol_deg", 1.0))
     cart_timeout = float(m_cfg.get("cartesian_timeout_s", 8.0))
 
+    def _move(tag: str, pose: np.ndarray, *, linear: bool, speed: int) -> None:
+        """Command a cartesian target and fail loud on timeout.
+
+        Wraps :py:meth:`PiperController.move_to_pose` so every waypoint
+        in the grasp sequence checks its own arrival. Previously we
+        called ``end_pose_ctrl`` + ``wait_cartesian_arrive`` and threw
+        away the boolean -- a timeout on the approach would silently
+        continue into ``close_until`` and the lift motion, potentially
+        driving the arm through the object / table.
+        """
+        log.info(
+            "moving to %s: xyz=%s",
+            tag, np.array2string(pose[:3, 3], precision=3),
+        )
+        ok = piper.move_to_pose(
+            pose,
+            linear=linear,
+            speed_pct=speed,
+            pos_tol_m=pos_tol,
+            ang_tol_deg=ang_tol,
+            timeout_s=cart_timeout,
+        )
+        if not ok:
+            cur = piper.get_end_pose_matrix()
+            err_xyz = cur[:3, 3] - pose[:3, 3]
+            raise RuntimeError(
+                f"timeout reaching {tag}; residual xyz error "
+                f"({err_xyz[0]*1000:.1f}, {err_xyz[1]*1000:.1f}, {err_xyz[2]*1000:.1f}) mm"
+            )
+
     log.info("opening gripper to %.3f m", float(g_cfg["max_opening_m"]))
     piper.open_gripper(
         opening_m=float(g_cfg["max_opening_m"]),
@@ -296,53 +454,61 @@ def _execute_grasp(
     )
     time.sleep(0.3)
 
-    pre = grasp.pre_grasp
-    log.info(
-        "moving to pre-grasp: xyz=%s",
-        np.array2string(pre[:3, 3], precision=3),
-    )
-    piper.end_pose_ctrl(pre, linear=False, speed_pct=speed_cart)
-    piper.wait_cartesian_arrive(
-        pre, pos_tol_m=pos_tol, ang_tol_deg=ang_tol, timeout_s=cart_timeout
+    _move("pre-grasp", grasp.pre_grasp, linear=False, speed=speed_cart)
+    time.sleep(0.2)
+
+    _move(
+        "grasp",
+        grasp.T_B_grasp,
+        linear=True,
+        speed=max(5, speed_cart // 2),
     )
     time.sleep(0.2)
 
-    log.info("linear approach to grasp")
-    piper.end_pose_ctrl(grasp.T_B_grasp, linear=True, speed_pct=max(5, speed_cart // 2))
-    piper.wait_cartesian_arrive(
-        grasp.T_B_grasp, pos_tol_m=pos_tol, ang_tol_deg=ang_tol, timeout_s=cart_timeout
-    )
-    time.sleep(0.2)
-
-    # Close to ``close_opening_m`` (narrower than the object) so the jaws
-    # squeeze the object. Using open_gripper() keeps the unit conversion
-    # (m -> mm) in one place (PiperController), rather than repeating the
-    # *1000 factor here.
+    # Close with feedback: stop when the jaws stall or reach the
+    # commanded narrow opening.  ``close_until`` returns both the
+    # result and the final opening so we can verify the grasp.
     log.info(
         "closing gripper to %.1f mm (object width %.1f mm)",
         grasp.close_opening_m * 1000.0,
         grasp.object_width_m * 1000.0,
     )
-    piper.open_gripper(
-        opening_m=grasp.close_opening_m,
-        effort_mNm=effort_mNm,
+    stall_eps = float(g_cfg.get("close_stall_eps_m", 0.0003))
+    close_timeout = float(g_cfg.get("close_timeout_s", 2.0))
+    ok_close, final_opening = piper.close_until(
+        target_opening_m=grasp.close_opening_m,
+        effort_mNm=close_effort_mNm,
+        timeout_s=close_timeout,
+        stall_eps_m=stall_eps,
     )
-    time.sleep(0.6)
+    log.info(
+        "gripper settled at %.1f mm (reached=%s)",
+        final_opening * 1000.0, ok_close,
+    )
 
-    log.info("lifting")
-    lift_pose = grasp.lift
-    piper.end_pose_ctrl(lift_pose, linear=True, speed_pct=max(5, speed_cart // 2))
-    piper.wait_cartesian_arrive(
-        lift_pose, pos_tol_m=pos_tol, ang_tol_deg=ang_tol, timeout_s=cart_timeout
+    grasp_tol_m = float(g_cfg.get("grasp_check_tol_m", 0.006))
+    min_grip_m = float(g_cfg.get("grasp_check_min_m", 0.003))
+    is_held, _ = piper.check_grasp(
+        expected_width_m=grasp.object_width_m,
+        min_width_m=min_grip_m,
+        tol_m=grasp_tol_m,
     )
+    if not is_held:
+        piper.open_gripper(
+            opening_m=float(g_cfg["max_opening_m"]),
+            effort_mNm=effort_mNm,
+        )
+        raise RuntimeError(
+            f"grasp check failed: final opening {final_opening*1000:.1f} mm vs "
+            f"expected object width {grasp.object_width_m*1000:.1f} mm "
+            f"(tol {grasp_tol_m*1000:.1f} mm); object likely slipped or missing"
+        )
+
+    _move("lift", grasp.lift, linear=True, speed=max(5, speed_cart // 2))
     time.sleep(0.2)
 
     if place_pose_base is not None:
-        log.info("moving to place pose")
-        piper.end_pose_ctrl(place_pose_base, linear=False, speed_pct=speed_cart)
-        piper.wait_cartesian_arrive(
-            place_pose_base, pos_tol_m=pos_tol, ang_tol_deg=ang_tol, timeout_s=cart_timeout
-        )
+        _move("place", place_pose_base, linear=False, speed=speed_cart)
         piper.open_gripper(
             opening_m=float(g_cfg["max_opening_m"]),
             effort_mNm=effort_mNm,
@@ -458,6 +624,40 @@ def _show_plan_3d(
 
 
 # ---------------------------------------------------------------------------
+# Place pose helpers
+# ---------------------------------------------------------------------------
+def _resolve_place_pose(
+    cfg: dict,
+    classes: dict[int, dict],
+    class_id: int,
+    log,
+) -> np.ndarray:
+    """Build the release pose from (per-class or global) config.
+
+    ``classes.yaml`` may carry a ``place: {xyz_m, tilt_deg, yaw_deg}``
+    block per class (e.g. to sort bottles into one bin and cans into
+    another). Any missing field falls back to the top-level ``place:``
+    section in ``system.yaml``.
+    """
+    global_place = cfg.get("place", {}) or {}
+    class_place = (classes.get(class_id, {}) or {}).get("place", {}) or {}
+
+    xyz = class_place.get("xyz_m", global_place.get("xyz_m", [0.30, -0.15, 0.18]))
+    tilt = float(class_place.get("tilt_deg", global_place.get("tilt_deg", 0.0)))
+    yaw = float(class_place.get("yaw_deg", global_place.get("yaw_deg", 0.0)))
+
+    R = camera_look_down_rotation(tilt_deg=tilt, yaw_deg=yaw)
+    place = np.eye(4)
+    place[:3, :3] = R
+    place[:3, 3] = [float(v) for v in xyz]
+    log.info(
+        "place pose for class %d: xyz=(%.3f, %.3f, %.3f), tilt=%.1f deg, yaw=%.1f deg",
+        class_id, xyz[0], xyz[1], xyz[2], tilt, yaw,
+    )
+    return place
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def main() -> None:
@@ -465,9 +665,9 @@ def main() -> None:
     ap.add_argument("--config", type=Path, default=Path("configs/system.yaml"))
     ap.add_argument(
         "--target-class",
-        type=int,
+        type=str,
         default=None,
-        help="only grasp instances of this class id",
+        help="only grasp instances of this class id (int) or name (from classes.yaml)",
     )
     ap.add_argument(
         "--no-active-perception",
@@ -495,10 +695,20 @@ def main() -> None:
         action="store_true",
         help="open an interactive Open3D preview of the plan before motion",
     )
+    ap.add_argument(
+        "--yes",
+        action="store_true",
+        help="skip the confirm-before-motion prompt used with --viz-3d",
+    )
     args = ap.parse_args()
 
-    log = get_logger("main")
     cfg = load_config(args.config)
+
+    # Configure logging level from config (can still be overridden by
+    # callers that reach into logging directly).
+    level_name = str(cfg.get("logging", {}).get("level", "INFO")).upper()
+    log_level = getattr(logging, level_name, logging.INFO)
+    log = get_logger("main", level=log_level)
 
     # Visualization artifacts (images / PLYs / npz) are written only when
     # --visualize is set. --viz-3d alone just opens the interactive
@@ -530,10 +740,15 @@ def main() -> None:
         list(classes.keys()),
     )
 
+    target_class = _resolve_target_class(args.target_class, classes)
+    if args.target_class is not None:
+        log.info("filtering detections to class %s -> id %s", args.target_class, target_class)
+
     class_names = {k: v.get("name", str(k)) for k, v in classes.items()}
     detector = SegmentationDetector(
         model_path=project_path(cfg["paths"]["model"]),
         conf=float(cfg["perception"]["conf_threshold"]),
+        device=cfg.get("perception", {}).get("device"),
         class_names=class_names,
     )
 
@@ -559,181 +774,255 @@ def main() -> None:
         # at shutdown is surprising during bring-up and can make the arm sag.
         piper.disable_on_disconnect = False
 
-        # CAN health check: GetArmJointMsgs will silently return stale
-        # zeros if the reader thread is not actually receiving frames.
-        # Fail loud here rather than moving to a bogus observe pose.
-        if not piper.is_ok():
-            raise RuntimeError(
-                f"CAN reader is not receiving frames on {can_port}; check "
-                "`ip link show {can_port}`, CAN wiring, and that the arm is powered."
+        # One-shot soft-stop guard: any exception or Ctrl+C from this
+        # point on triggers the safe retreat + soft stop path, so the
+        # arm never ends a run still holding an object or in the middle
+        # of a MOVE_L.
+        try:
+            _run_pipeline(
+                piper=piper,
+                cam=cam,
+                detector=detector,
+                cfg=cfg,
+                classes=classes,
+                target_class=target_class,
+                T_E_C=T_E_C,
+                intr=intr,
+                K_cal=K_cal,
+                dist_cal=dist_cal,
+                args=args,
+                viz_dir=viz_dir,
+                log=log,
             )
-        log.info("piper CAN fps ~ %.0f Hz", piper.can_fps())
-
-        # Optional first-time gripper parameter push. Safe to re-send on
-        # every run: the controller just writes the same values back.
-        gtp_cfg = piper_cfg.get("gripper_teach_pendant", {}) or {}
-        if gtp_cfg.get("enable", False):
-            stroke_mm = int(gtp_cfg.get("stroke_mm", 100))
-            max_range_mm = int(gtp_cfg.get("max_range_mm", 70))
-            log.info(
-                "pushing gripper teach-pendant params: stroke=%d mm, max_range=%d mm",
-                stroke_mm, max_range_mm,
-            )
-            piper.gripper_teaching_pendant_param_config(
-                teach_pendant_stroke_mm=stroke_mm,
-                max_range_mm=max_range_mm,
-            )
-
-        # Sanity-check calibration vs. runtime stream.
-        rs_intr = cam.intrinsics
-        if (rs_intr.width, rs_intr.height) != (intr["width"], intr["height"]):
-            log.warning(
-                "calibration resolution %dx%d differs from live stream %dx%d; "
-                "consider re-running calibrate_intrinsics at the current settings",
-                intr["width"], intr["height"], rs_intr.width, rs_intr.height,
-            )
-
-        # 1) observe pose
-        _go_to_observe(piper, cfg, log)
-
-        # 2) rough perception
-        det, pose_cam_rough, T_B_E_rough, T_B_O_rough, color_rough, pcd_rough_cam = _snapshot_T_B_O(
-            piper, cam, detector, cfg, args.target_class, T_E_C, log,
-            K=K_cal, dist=dist_cal,
-        )
-        log.info(
-            "T_B_O (rough) translation: %s",
-            np.array2string(T_B_O_rough[:3, 3], precision=4),
-        )
-        if viz_dir is not None:
-            _save_perception_snapshot(
-                viz_dir, "rough", color_rough, det, pose_cam_rough,
-                pcd_rough_cam, T_B_E_rough, T_E_C, K_cal, log,
-            )
-
-        # Track the freshest scene cloud + EEF pose so the final 3D preview
-        # can be in the same frame as the grasp plan. Active perception
-        # overwrites these if it succeeds.
-        color_best = color_rough
-        pcd_best_cam = pcd_rough_cam
-        T_B_E_best = T_B_E_rough
-
-        # 3) optional close-up active perception
-        T_B_O_final = T_B_O_rough
-        extent_final = pose_cam_rough.extent
-        if cfg["active_perception"].get("enable", True) and not args.no_active_perception:
+        except KeyboardInterrupt:
+            log.warning("user interrupt; soft-stopping arm")
             try:
-                det_f, pose_cam_fine, T_B_E_fine, T_B_O_fine, color_fine, pcd_fine_cam = (
-                    _active_perception_close_up(
-                        piper,
-                        cam,
-                        detector,
-                        cfg,
-                        T_E_C,
-                        T_B_O_rough,
-                        pose_cam_rough.extent,
-                        args.target_class,
-                        log,
-                        K=K_cal,
-                        dist=dist_cal,
-                    )
-                )
-                if viz_dir is not None:
-                    _save_perception_snapshot(
-                        viz_dir, "fine", color_fine, det_f, pose_cam_fine,
-                        pcd_fine_cam, T_B_E_fine, T_E_C, K_cal, log,
-                    )
-                color_best = color_fine
-                pcd_best_cam = pcd_fine_cam
-                T_B_E_best = T_B_E_fine
-                ap_cfg = cfg["active_perception"]
-                # Align the fine OBB axes to the rough ones *before* fusing,
-                # so that fuse_poses blends rotations that mean the same
-                # thing physically. Without this, a 90 deg axis swap would
-                # slerp through a garbage mid-pose, and extent_final would
-                # describe a different axis than R in the fused result.
-                R_fine_aligned, extent_fine_aligned = align_obb_axes(
-                    T_B_O_rough[:3, :3],
-                    pose_cam_rough.extent,
-                    T_B_O_fine[:3, :3],
-                    pose_cam_fine.extent,
-                )
-                T_B_O_fine_aligned = T_B_O_fine.copy()
-                T_B_O_fine_aligned[:3, :3] = R_fine_aligned
-                T_B_O_final = fuse_poses(
-                    T_B_O_rough,
-                    T_B_O_fine_aligned,
-                    weight_rough=float(ap_cfg.get("fuse_rough_weight", 0.3)),
-                    weight_fine=float(ap_cfg.get("fuse_fine_weight", 0.7)),
-                )
-                extent_final = extent_fine_aligned
-                log.info(
-                    "T_B_O (fused) translation: %s",
-                    np.array2string(T_B_O_final[:3, 3], precision=4),
-                )
+                piper.stop()
             except Exception as exc:
-                log.warning("active perception failed (%s); using rough estimate", exc)
+                log.warning("piper.stop() raised: %s", exc)
+            raise
+        except Exception:
+            log.exception("pipeline error; attempting safe retreat")
+            try:
+                _safe_retreat(piper, cfg, log)
+            except Exception as exc:
+                log.warning("safe_retreat raised: %s", exc)
+            raise
 
-        # 4) class-specific planner tweaks (approach, gripper max)
-        cinfo = classes.get(det.class_id, {}) if classes else {}
-        max_opening_m = float(cinfo.get("max_opening_mm", cfg["grasp"]["max_opening_m"] * 1000.0)) / 1000.0
-        lift_m = float(cinfo.get("safe_height_mm", cfg["grasp"]["lift_height_m"] * 1000.0)) / 1000.0
 
-        grasp = plan_topdown_grasp(
-            T_B_O=T_B_O_final,
-            extent=extent_final,
-            approach_world=tuple(cfg["grasp"]["approach_direction_world"]),
-            opening_margin_m=float(cfg["grasp"]["opening_margin_m"]),
-            close_overclose_m=float(cfg["grasp"].get("close_overclose_m", 0.002)),
-            approach_m=float(cfg["grasp"]["pre_grasp_offset_m"]),
-            lift_m=lift_m,
-            max_opening_m=max_opening_m,
+def _run_pipeline(
+    *,
+    piper: PiperController,
+    cam: RealSenseCamera,
+    detector: SegmentationDetector,
+    cfg: dict,
+    classes: dict,
+    target_class: Optional[int],
+    T_E_C: np.ndarray,
+    intr: dict,
+    K_cal: np.ndarray,
+    dist_cal: np.ndarray,
+    args,
+    viz_dir: Optional[Path],
+    log,
+) -> None:
+    """The full observe -> detect -> plan -> execute -> home loop.
+
+    Extracted from :func:`main` so the caller can wrap the whole thing
+    in a single ``try/except`` for uniform safe-retreat handling.
+    """
+    piper_cfg = cfg["piper"]
+    can_port = piper_cfg["can_port"]
+
+    # CAN health check: GetArmJointMsgs will silently return stale
+    # zeros if the reader thread is not actually receiving frames.
+    # Fail loud here rather than moving to a bogus observe pose.
+    if not piper.is_ok():
+        raise RuntimeError(
+            f"CAN reader is not receiving frames on {can_port}; check "
+            f"`ip link show {can_port}`, CAN wiring, and that the arm is powered."
         )
+    min_fps = float(cfg.get("motion", {}).get("min_can_fps", 50.0))
+    fps = piper.can_fps()
+    log.info("piper CAN fps ~ %.0f Hz", fps)
+    if fps < min_fps:
+        raise RuntimeError(
+            f"CAN fps {fps:.0f} Hz below minimum {min_fps:.0f} Hz; "
+            "check CAN wiring / bitrate before attempting motion"
+        )
+
+    # Optional first-time gripper parameter push. Safe to re-send on
+    # every run: the controller just writes the same values back.
+    gtp_cfg = piper_cfg.get("gripper_teach_pendant", {}) or {}
+    if gtp_cfg.get("enable", False):
+        stroke_mm = int(gtp_cfg.get("stroke_mm", 100))
+        max_range_mm = int(gtp_cfg.get("max_range_mm", 70))
         log.info(
-            "grasp plan: opening=%.1f mm, feasible=%s, reason=%s",
-            grasp.opening_m * 1000.0,
-            grasp.feasible,
-            grasp.reason,
+            "pushing gripper teach-pendant params: stroke=%d mm, max_range=%d mm",
+            stroke_mm, max_range_mm,
         )
-        if not grasp.feasible:
-            log.error("aborting: %s", grasp.reason)
-            return
-
-        # 5) Build place pose from config. Position comes from ``place.xyz_m``;
-        # the orientation is an independent top-down frame (not copied from the
-        # grasp R, since a tilted grasp would then drop the object sideways).
-        # We build it here (before the dry-run short-circuit) so visualization
-        # can include the place frame, and so the final 3D preview matches
-        # what will actually be executed.
-        place_cfg = cfg.get("place", {}) or {}
-        place_xyz = place_cfg.get("xyz_m", [0.30, -0.15, 0.18])
-        place_R = camera_look_down_rotation(
-            tilt_deg=float(place_cfg.get("tilt_deg", 0.0)),
-            yaw_deg=float(place_cfg.get("yaw_deg", 0.0)),
+        piper.gripper_teaching_pendant_param_config(
+            teach_pendant_stroke_mm=stroke_mm,
+            max_range_mm=max_range_mm,
         )
-        place = np.eye(4)
-        place[:3, :3] = place_R
-        place[:3, 3] = [float(x) for x in place_xyz]
 
-        # Plan visualization: on-disk artifacts + optional interactive preview.
-        # Done before motion so a bad plan can be caught at a glance.
-        if viz_dir is not None:
-            _save_plan_artifacts(viz_dir, T_B_O_final, extent_final, grasp, place, log)
-        if args.viz_3d:
-            _show_plan_3d(
-                pcd_best_cam, T_B_E_best, T_E_C,
-                T_B_O_final, extent_final, grasp, place, log,
+    # Sanity-check calibration vs. runtime stream.
+    rs_intr = cam.intrinsics
+    if (rs_intr.width, rs_intr.height) != (intr["width"], intr["height"]):
+        log.warning(
+            "calibration resolution %dx%d differs from live stream %dx%d; "
+            "consider re-running calibrate_intrinsics at the current settings",
+            intr["width"], intr["height"], rs_intr.width, rs_intr.height,
+        )
+
+    # 1) observe pose
+    _go_to_observe(piper, cfg, log)
+
+    # 2) rough perception
+    det, pose_cam_rough, T_B_E_rough, T_B_O_rough, color_rough, pcd_rough_cam = _snapshot_T_B_O(
+        piper, cam, detector, cfg, target_class, T_E_C, log,
+        K=K_cal, dist=dist_cal,
+        retries=int(cfg.get("perception", {}).get("retries", 2)),
+    )
+    log.info(
+        "T_B_O (rough) translation: %s",
+        np.array2string(T_B_O_rough[:3, 3], precision=4),
+    )
+    if viz_dir is not None:
+        _save_perception_snapshot(
+            viz_dir, "rough", color_rough, det, pose_cam_rough,
+            pcd_rough_cam, T_B_E_rough, T_E_C, K_cal, log,
+        )
+
+    # Track the freshest scene cloud + EEF pose so the final 3D preview
+    # can be in the same frame as the grasp plan. Active perception
+    # overwrites these if it succeeds.
+    pcd_best_cam = pcd_rough_cam
+    T_B_E_best = T_B_E_rough
+
+    # 3) optional close-up active perception
+    T_B_O_final = T_B_O_rough
+    extent_final = pose_cam_rough.extent
+    if cfg["active_perception"].get("enable", True) and not args.no_active_perception:
+        try:
+            det_f, pose_cam_fine, T_B_E_fine, T_B_O_fine, color_fine, pcd_fine_cam = (
+                _active_perception_close_up(
+                    piper,
+                    cam,
+                    detector,
+                    cfg,
+                    T_E_C,
+                    T_B_O_rough,
+                    pose_cam_rough.extent,
+                    target_class,
+                    log,
+                    K=K_cal,
+                    dist=dist_cal,
+                )
             )
+            if viz_dir is not None:
+                _save_perception_snapshot(
+                    viz_dir, "fine", color_fine, det_f, pose_cam_fine,
+                    pcd_fine_cam, T_B_E_fine, T_E_C, K_cal, log,
+                )
+            pcd_best_cam = pcd_fine_cam
+            T_B_E_best = T_B_E_fine
+            ap_cfg = cfg["active_perception"]
+            # Align the fine OBB axes to the rough ones *before* fusing,
+            # so that fuse_poses blends rotations that mean the same
+            # thing physically. Without this, a 90 deg axis swap would
+            # slerp through a garbage mid-pose, and extent_final would
+            # describe a different axis than R in the fused result.
+            R_fine_aligned, extent_fine_aligned = align_obb_axes(
+                T_B_O_rough[:3, :3],
+                pose_cam_rough.extent,
+                T_B_O_fine[:3, :3],
+                pose_cam_fine.extent,
+            )
+            T_B_O_fine_aligned = T_B_O_fine.copy()
+            T_B_O_fine_aligned[:3, :3] = R_fine_aligned
+            T_B_O_final = fuse_poses(
+                T_B_O_rough,
+                T_B_O_fine_aligned,
+                weight_rough=float(ap_cfg.get("fuse_rough_weight", 0.3)),
+                weight_fine=float(ap_cfg.get("fuse_fine_weight", 0.7)),
+            )
+            extent_final = extent_fine_aligned
+            log.info(
+                "T_B_O (fused) translation: %s",
+                np.array2string(T_B_O_final[:3, 3], precision=4),
+            )
+        except Exception as exc:
+            log.warning("active perception failed (%s); using rough estimate", exc)
 
-        if args.dry_run:
-            log.info("dry-run; skipping motion")
-            return
+    # 4) class-specific planner tweaks (approach, gripper max)
+    cinfo = classes.get(det.class_id, {}) if classes else {}
+    max_opening_m = float(cinfo.get("max_opening_mm", cfg["grasp"]["max_opening_m"] * 1000.0)) / 1000.0
+    lift_m = float(cinfo.get("safe_height_mm", cfg["grasp"]["lift_height_m"] * 1000.0)) / 1000.0
+    # Per-class over-close override wins over the global default.
+    global_overclose = float(cfg["grasp"].get("close_overclose_m", 0.002))
+    close_overclose_m = float(
+        cinfo.get("close_overclose_mm", global_overclose * 1000.0)
+    ) / 1000.0
 
-        _execute_grasp(piper, cfg, grasp, place_pose_base=place, log=log)
+    grasp = plan_topdown_grasp(
+        T_B_O=T_B_O_final,
+        extent=extent_final,
+        approach_world=tuple(cfg["grasp"]["approach_direction_world"]),
+        opening_margin_m=float(cfg["grasp"]["opening_margin_m"]),
+        close_overclose_m=close_overclose_m,
+        approach_m=float(cfg["grasp"]["pre_grasp_offset_m"]),
+        lift_m=lift_m,
+        max_opening_m=max_opening_m,
+        workspace=cfg.get("workspace"),
+    )
+    log.info(
+        "grasp plan: opening=%.1f mm, feasible=%s, reason=%s",
+        grasp.opening_m * 1000.0,
+        grasp.feasible,
+        grasp.reason,
+    )
+    if not grasp.feasible:
+        log.error("aborting: %s", grasp.reason)
+        return
 
-        # 6) return home by going back to observe pose.
-        _go_to_observe(piper, cfg, log)
-        log.info("done")
+    # 5) Build place pose (possibly per-class) before the dry-run short-
+    # circuit so visualization reflects what will actually be executed.
+    place = _resolve_place_pose(cfg, classes, det.class_id, log)
+
+    # Plan visualization: on-disk artifacts + optional interactive preview.
+    # Done before motion so a bad plan can be caught at a glance.
+    if viz_dir is not None:
+        _save_plan_artifacts(viz_dir, T_B_O_final, extent_final, grasp, place, log)
+    if args.viz_3d:
+        _show_plan_3d(
+            pcd_best_cam, T_B_E_best, T_E_C,
+            T_B_O_final, extent_final, grasp, place, log,
+        )
+        if not args.dry_run and not args.yes:
+            try:
+                # Explicit opt-in after the 3D review, mirrors what a
+                # human would do in a bring-up context. --yes bypasses
+                # this for scripted runs (e.g. overnight tests).
+                answer = input("Proceed with motion? [y/N] ").strip().lower()
+            except EOFError:
+                answer = ""
+            if answer not in ("y", "yes"):
+                log.info("user declined motion; aborting")
+                return
+
+    if args.dry_run:
+        log.info("dry-run; skipping motion")
+        return
+
+    _execute_grasp(piper, cfg, grasp, place_pose_base=place, log=log)
+
+    # 6) Always open gripper + lift before going home, so a stray
+    # object (or a partially-succeeded place) doesn't get dragged
+    # through the workspace on the way back to observe.
+    _safe_retreat(piper, cfg, log)
+    _go_to_observe(piper, cfg, log)
+    log.info("done")
 
 
 if __name__ == "__main__":
