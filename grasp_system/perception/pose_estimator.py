@@ -73,23 +73,24 @@ def backproject_mask_to_pointcloud(
         raise ValueError("mask must match depth image shape")
 
     mask_bool = mask.astype(bool)
-    depth = depth_m.astype(np.float32).copy()
-    depth[~mask_bool] = 0.0
-    depth[depth > float(depth_trunc_m)] = 0.0
+    depth = depth_m.astype(np.float32)
 
     fx, fy = float(K[0, 0]), float(K[1, 1])
     cx, cy = float(K[0, 2]), float(K[1, 2])
 
     H, W = depth.shape
-    us, vs = np.meshgrid(np.arange(W), np.arange(H))
-    zs = depth
-    valid = zs > 0
+
+    # Only compute coordinates for masked pixels with valid depth,
+    # avoiding a full-image meshgrid allocation that is wasteful for
+    # small object masks (typically <5% of pixels).
+    valid = mask_bool & (depth > 0) & (depth <= float(depth_trunc_m))
     if not np.any(valid):
         return o3d.geometry.PointCloud()
 
-    u = us[valid].astype(np.float32)
-    v = vs[valid].astype(np.float32)
-    z = zs[valid].astype(np.float32)
+    vs_arr, us_arr = np.nonzero(valid)
+    u = us_arr.astype(np.float32)
+    v = vs_arr.astype(np.float32)
+    z = depth[valid].astype(np.float32)
 
     # Undistort pixel coordinates using the calibrated distortion model
     # before pinhole back-projection. If ``dist`` is omitted or effectively

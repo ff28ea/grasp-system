@@ -727,15 +727,15 @@ class PiperController:
         """
         msg = self.raw.GetArmGripperMsgs().gripper_state
         # Newer SDK uses ``grippers_angle``; older versions use
-        # ``gripper_angle``. ``getattr(..., default)`` still returns the
-        # attribute when it exists but is ``None``, which would then
-        # crash ``float()``; fall through explicitly in that case.
+        # ``gripper_angle``. Try both, defaulting to 0.
         raw_pos = getattr(msg, "grippers_angle", None)
         if raw_pos is None:
-            raw_pos = getattr(msg, "gripper_angle", 0.0)
+            raw_pos = getattr(msg, "gripper_angle", None)
         if raw_pos is None:
             raw_pos = 0.0
-        opening_m = float(raw_pos) / _MM_TO_PIPER_GRIP / 1000.0
+        # Convert from 0.001 mm (PiPER internal) to meters:
+        # raw_pos / 1e6 = meters
+        opening_m = float(raw_pos) / _M_TO_PIPER_POS
         return max(0.0, opening_m)
 
     def get_gripper_effort_mNm(self) -> float:
@@ -870,13 +870,12 @@ class PiperController:
             teach_pendant_stroke_mm, max_range_mm
         )
 
+    # Backwards-compat alias: the previous public API exposed
+    # ``recover_errors``. The canonical name (``clear_errors``) aligns
+    # with SDK / UI terminology.
+    recover_errors = clear_errors
+
 
 def _wrap_deg(delta: np.ndarray) -> np.ndarray:
     """Wrap an angular difference (degrees) into [-180, 180]."""
     return (np.asarray(delta) + 180.0) % 360.0 - 180.0
-
-
-# Backwards-compat alias: the previous public API exposed ``recover_errors``.
-# Keep the name working so external scripts don't break; the new canonical
-# name (``clear_errors``) aligns with SDK / UI terminology.
-PiperController.recover_errors = PiperController.clear_errors  # type: ignore[attr-defined]

@@ -211,22 +211,32 @@ def main() -> None:
     workers = args.workers if args.workers is not None else _default_workers(device)
 
     model = YOLO(args.model)
-    results = model.train(
-        data=str(ultralytics_data_yaml),
-        task="segment",
-        epochs=args.epochs,
-        batch=args.batch,
-        imgsz=args.imgsz,
-        device=device,
-        workers=workers,
-        project=str(project_dir),
-        name=args.name,
-        patience=args.patience,
-        seed=args.seed,
-        exist_ok=True,
-        resume=args.resume,
-        conf=args.conf,
-    )
+    try:
+        results = model.train(
+            data=str(ultralytics_data_yaml),
+            task="segment",
+            epochs=args.epochs,
+            batch=args.batch,
+            imgsz=args.imgsz,
+            device=device,
+            workers=workers,
+            project=str(project_dir),
+            name=args.name,
+            patience=args.patience,
+            seed=args.seed,
+            exist_ok=True,
+            resume=args.resume,
+            conf=args.conf,
+        )
+    finally:
+        # Clean up the temporary data yaml (created by
+        # _write_ultralytics_data_yaml with delete=False) to prevent
+        # temp file leaks on repeated training runs.
+        if ultralytics_data_yaml != data_yaml:
+            try:
+                ultralytics_data_yaml.unlink(missing_ok=True)
+            except OSError:
+                pass
 
     save_dir = Path(getattr(results, "save_dir", project_dir / args.name))
     best_pt = save_dir / "weights" / "best.pt"

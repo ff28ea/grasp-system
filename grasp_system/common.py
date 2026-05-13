@@ -255,10 +255,13 @@ def load_intrinsics(path: str | Path) -> Dict[str, Any]:
         raise ValueError(f"intrinsics dist must be 1D or 2D, got shape {dist.shape}")
     # OpenCV supports 4/5/8/12/14 distortion coefficients; anything else
     # is almost certainly a file authored by hand with a wrong layout.
-    dist_flat = dist.reshape(-1)
-    if dist_flat.size not in (4, 5, 8, 12, 14):
+    # Always flatten to 1-D so downstream consumers (cv2.undistortPoints,
+    # cv2.calibrateHandEye, etc.) receive a consistent shape without
+    # having to call reshape themselves.
+    dist = dist.reshape(-1)
+    if dist.size not in (4, 5, 8, 12, 14):
         raise ValueError(
-            f"intrinsics dist has {dist_flat.size} coefficients; expected "
+            f"intrinsics dist has {dist.size} coefficients; expected "
             "4/5/8/12/14 (OpenCV convention)"
         )
     if not (K[0, 0] > 0 and K[1, 1] > 0):
