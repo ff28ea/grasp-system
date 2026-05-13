@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+
+# Editors
+.vscode/
+.idea/
+
+# Calibration / runtime artefacts (commit only .gitkeep)
+grasp_system/models/*
+!grasp_system/models/.gitkeep
+grasp_system/configs/intrinsics_previews/
+grasp_system/configs/T_eef_cam.npy
+grasp_system/configs/observe_joints.npy
+grasp_system/configs/handeye_report.npz
+
+# Captured data
+#datasets/
+#runs/
+*.ckpt
+*.pt
+!grasp_system/models/best.pt
+!grasp_system/models/.gitkeep
