@@ -15,6 +15,17 @@ camera:
   clip_distance_m: 1.5
   align_to: color
   warmup_frames: 30           # frames to skip so AE/AWB settle before first grab
+  # D435i depth post-processing. Enable one or more of these to reduce
+  # the "flying pixels" that appear at mask boundaries when the object
+  # edge meets the background.
+  #   spatial_filter       -- edge-preserving smoothing, cheap, always safe.
+  #   temporal_filter      -- time averaging, best when the arm is still.
+  #                           May smear depth if the camera is moving.
+  #   hole_filling_filter  -- fills invalid pixels; use sparingly on
+  #                           thin objects (can hallucinate at edges).
+  spatial_filter: true
+  temporal_filter: true
+  hole_filling_filter: false
 
 chessboard:
   pattern_size: [11, 8]       # inner corners (cols, rows) for a 12x9 board
@@ -62,7 +73,17 @@ perception:
     # this tolerance are treated as the support surface and removed;
     # the object's own dominant face is preserved.
     normal_tol_deg: 25.0
+  # Optional second outlier pass after plane removal. Kills isolated
+  # flying pixels that survive statistical outlier removal. Set
+  # nb_points: 0 to disable.
+  radius_outlier:
+    nb_points: 0              # >0 enables; 8-16 is a reasonable range
+    radius_m: 0.01
   icp:
+    # Turn on only after authoring a template point cloud per class
+    # (classes.yaml -> template_ply). Without a template the
+    # refinement is skipped silently, so enabling this is safe even
+    # when templates are missing.
     enable: false
     voxel_size_m: 0.003
     fitness_threshold: 0.6

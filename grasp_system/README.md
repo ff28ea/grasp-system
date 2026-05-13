@@ -19,7 +19,7 @@ grasp_system/
 ├── perception/
 │   ├── camera.py                  # RealSenseCamera (context managed)
 │   ├── detector.py                # YOLOv8-seg wrapper -> Detection[]
-│   └── pose_estimator.py          # back-project + clean + OBB + ICP
+│   └── pose_estimator.py          # back-project + clean + OBB (+ optional ICP)
 ├── planning/
 │   └── grasp_planner.py           # OBB -> top-down grasp frame + opening
 ├── control/
@@ -90,3 +90,24 @@ The canonical transform chain is `T_B_O = T_B_E · T_E_C · T_C_O`.
 - Verify every hand-eye session with the constant-target test (the
   calibration script prints the std of the board origin in the base
   frame). If std > 5 mm, do not attempt to grasp.
+
+## Optional: ICP pose refinement
+
+The OBB-based pose is usually sufficient for top-down parallel-jaw
+grasps. If you need tighter pose (e.g. for side-approach or for
+objects whose OBB principal axes are ambiguous), the pipeline can
+optionally refine `T_C_O` with point-to-plane ICP against a
+per-class template point cloud.
+
+To enable:
+
+1. Capture or author a PLY point cloud of the object in its own
+   frame (origin at the center, axes aligned with the intended OBB
+   axes). Store it under `grasp_system/models/<class_name>.ply`.
+2. Add `template_ply: models/<class_name>.ply` to the matching entry
+   in `configs/classes.yaml`.
+3. Set `perception.icp.enable: true` in `configs/system.yaml`.
+
+If any of those three pieces is missing at runtime, the pipeline
+silently falls back to the OBB pose -- enabling `icp.enable` is safe
+even before templates have been authored for every class.

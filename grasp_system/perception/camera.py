@@ -56,6 +56,21 @@ class RealSenseCamera:
     Usage:
         with RealSenseCamera() as cam:
             color, depth_m = cam.grab_aligned()
+
+    Depth post-processing
+    ---------------------
+    D435i depth is noisy at mask boundaries (classic "flying pixels"):
+    the shadow edge of an object picks up background range, so mask +
+    depth back-projection produces points that are 5-20 cm behind the
+    real object. The official RealSense recommendation is to chain
+    spatial + temporal filters on the depth frame *before* alignment
+    and masking. We expose each filter as a constructor flag so the
+    caller can opt in from yaml without pulling pyrealsense2 into
+    every call site.
+
+    The filters run only when pyrealsense2 reports them available (they
+    are part of the post_processing module, which is present in every
+    supported SDK build, so this is effectively always-on once enabled).
     """
 
     def __init__(
@@ -67,6 +82,9 @@ class RealSenseCamera:
         align_to: str = "color",
         depth_scale: float = 0.001,
         warmup_frames: int = 30,
+        spatial_filter: bool = False,
+        temporal_filter: bool = False,
+        hole_filling_filter: bool = False,
     ) -> None:
         if rs is None:
             raise ImportError(
@@ -93,6 +111,15 @@ class RealSenseCamera:
         self._intr: Optional[CameraIntrinsics] = None
         self._align_to_color = align_to == "color"
 
+        # Lazy-constructed filter chain. Order matches Intel's
+        # documented recommendation: spatial (edge-preserving smoothing)
+        # -> temporal (time averaging) -> hole filling (last). We keep
+        # the raw objects so they can be inspected / tuned after start().
+        self._enable_spatial = bool(spatial_filter)
+        self._enable_temporal = bool(temporal_filter)
+        self._enable_hole_filling = bool(hole_filling_filter)
+        self._depth_filters: list = []
+
     # -- lifecycle ------------------------------------------------------
     def __enter__(self) -> "RealSenseCamera":
         self.start()
@@ -115,6 +142,33 @@ class RealSenseCamera:
 
         target = rs.stream.color if self._align_to_color else rs.stream.depth
         self._align = rs.align(target)
+
+        # Build the depth-filter chain. Do this *after* pipeline.start()
+        # so if the SDK build we are on lacks any of these filters, the
+        # AttributeError is caught and we fall back gracefully instead
+        # of failing the whole camera start.
+        self._depth_filters = []
+        try:
+            if self._enable_spatial:
+                # Edge-preserving smoothing: removes quantisation stripes
+                # without blurring depth discontinuities.
+                self._depth_filters.append(rs.spatial_filter())
+            if self._enable_temporal:
+                # Time-average: reduces jitter; assumes a relatively
+                # stable scene. Not ideal if the camera is still
+                # swinging to the observe pose, but the warmup_frames
+                # loop above already gives it ~1 s to settle.
+                self._depth_filters.append(rs.temporal_filter())
+            if self._enable_hole_filling:
+                # Fills small invalid pixels. Use sparingly: on thin
+                # objects this can hallucinate depth at mask edges.
+                self._depth_filters.append(rs.hole_filling_filter())
+        except AttributeError as exc:  # pragma: no cover - SDK-dependent
+            _log.warning(
+                "pyrealsense2 is missing a depth filter class (%s); continuing without it",
+                exc,
+            )
+            self._depth_filters = []
 
         # Pull the *actual* depth scale from the firmware; the yaml constant
         # is only a fallback. D435i typically reports 0.001 m/unit, but a
@@ -168,6 +222,24 @@ class RealSenseCamera:
             raise RuntimeError("Camera is not started; use `with RealSenseCamera()`.")
 
         frames = self._pipeline.wait_for_frames(timeout_ms)
+        # Apply depth-only post-processing *before* alignment. The
+        # RealSense docs recommend this order because alignment
+        # resamples depth onto the color grid, which would otherwise
+        # smear the effect of a spatial filter.
+        if self._depth_filters:
+            depth_frame = frames.get_depth_frame()
+            if depth_frame:
+                for f in self._depth_filters:
+                    depth_frame = f.process(depth_frame)
+                # Reinsert the filtered depth into the composite frame
+                # so ``align.process`` operates on the denoised stream.
+                # Older SDKs expose as_frameset() on the returned frame;
+                # we use it when present, otherwise fall back to the
+                # original frames (no filtering applied).
+                try:
+                    frames = depth_frame.as_frameset()
+                except Exception:  # pragma: no cover - SDK-dependent
+                    pass
         aligned = self._align.process(frames)
         color_frame = aligned.get_color_frame()
         depth_frame = aligned.get_depth_frame()

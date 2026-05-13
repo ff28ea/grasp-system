@@ -61,10 +61,14 @@ except ImportError:  # pragma: no cover - hardware dependency
 
 
 # ---- Scale factors ----------------------------------------------------
-_M_TO_PIPER_POS = 1.0e6     # meters -> 0.001 mm
-_DEG_TO_PIPER_ANG = 1.0e3   # degrees -> 0.001 deg
+# PiPER's internal representation is uniform at 0.001 mm for every
+# position-like quantity. We derive the mm-scale from the m-scale
+# rather than hard-coding both so a copy/paste typo cannot make
+# EndPoseCtrl and GripperCtrl disagree on what "1 mm" means.
+_M_TO_PIPER_POS = 1.0e6                        # meters -> 0.001 mm
+_MM_TO_PIPER_GRIP = _M_TO_PIPER_POS / 1.0e3    # mm -> 0.001 mm (derived)
+_DEG_TO_PIPER_ANG = 1.0e3                      # degrees -> 0.001 deg
 _RAD_TO_PIPER_ANG = _DEG_TO_PIPER_ANG * 180.0 / math.pi
-_MM_TO_PIPER_GRIP = 1.0e3   # mm -> 0.001 mm
 # Note: the gripper effort unit accepted by GripperCtrl is mN*m
 # (SDK docstring: 0-5000 = 0-5 N/m). Callers pass ``effort_mNm`` through
 # directly, so there is no N*m->PiPER conversion factor here.
