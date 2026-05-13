@@ -1,23 +1,57 @@
 # Class index -> human readable label, optional grasp hints.
 # Keep the index order identical to your YOLOv8-seg training dataset.
+#
+# Per-class overrides (all optional):
+#   max_opening_mm     : Clamp for the commanded pre-grasp opening (mm).
+#   safe_height_mm     : Post-grasp lift height (mm), passed as lift_m to the planner.
+#   close_overclose_mm : How much narrower than the object the jaws close
+#                        (mm). Use smaller values for deformable / fragile
+#                        items, larger for rigid ones.
+#   close_effort_mNm   : Torque (mN*m) used specifically during close_until.
+#                        Omit to inherit grasp.close_effort_mNm from system.yaml.
+#   place              : Release pose for this class in base frame.
+#                        { xyz_m: [x,y,z], tilt_deg: t, yaw_deg: y }
+#                        Any missing sub-field falls back to the global
+#                        place: block in system.yaml.
 classes:
   0:
     name: BuildingBlocks
     approach: top_down        # top_down | side
     max_opening_mm: 65
     safe_height_mm: 120       # retreat height above pick point
+    close_overclose_mm: 2.0
+    close_effort_mNm: 1000
   1:
     name: bottle
     approach: top_down
     max_opening_mm: 55
     safe_height_mm: 140
+    # Bottles are often deformable; squeeze less and use a gentler torque.
+    close_overclose_mm: 0.5
+    close_effort_mNm: 600
+    place:
+      xyz_m: [0.30, -0.15, 0.20]
+      tilt_deg: 0.0
+      yaw_deg: 0.0
   2:
     name: can
     approach: top_down
     max_opening_mm: 55
     safe_height_mm: 120
+    close_overclose_mm: 1.0
+    close_effort_mNm: 800
+    place:
+      xyz_m: [0.30, -0.05, 0.20]
+      tilt_deg: 0.0
+      yaw_deg: 0.0
   3:
     name: cup
     approach: top_down
     max_opening_mm: 60
     safe_height_mm: 140
+    close_overclose_mm: 1.0
+    close_effort_mNm: 700
+    place:
+      xyz_m: [0.30, 0.05, 0.20]
+      tilt_deg: 0.0
+      yaw_deg: 0.0

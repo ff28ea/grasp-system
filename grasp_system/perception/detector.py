@@ -71,6 +71,17 @@ class SegmentationDetector:
         self.device = device
         self._class_names = class_names
         self._model = YOLO(self.model_path)
+        # Move the model to the requested device up front; otherwise the
+        # first ``predict(device=...)`` call has to shuffle weights
+        # between host and GPU, which adds ~1 s to the first frame and
+        # complicates reasoning about where inference actually ran.
+        if device is not None:
+            try:
+                self._model.to(device)
+            except Exception:  # pragma: no cover - optional pt backend
+                # e.g. requested cuda but only cpu is available -- let
+                # ultralytics fall back at predict() time and just log.
+                pass
 
     # -- inference ------------------------------------------------------
     def predict(

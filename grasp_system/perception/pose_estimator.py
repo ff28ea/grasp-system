@@ -136,8 +136,25 @@ def clean_pointcloud(
     plane_ransac_n: int = 3,
     plane_num_iterations: int = 1000,
     min_plane_points: int = 300,
+    up_in_cam: Optional[np.ndarray] = None,
+    plane_normal_tol_deg: float = 25.0,
 ) -> "o3d.geometry.PointCloud":
-    """Statistical outlier removal + voxel downsample + optional plane removal."""
+    """Statistical outlier removal + voxel downsample + optional plane removal.
+
+    Parameters
+    ----------
+    up_in_cam:
+        If given, a 3-vector pointing roughly "up" in the *camera* frame
+        (typically the base-frame +z expressed in camera coords). When
+        set, only planes whose normal sits within ``plane_normal_tol_deg``
+        of this direction are treated as table inliers; a flat face of
+        the object itself will therefore be preserved. If omitted, the
+        legacy "any dominant plane" behaviour is used.
+    plane_normal_tol_deg:
+        Tolerance (degrees) between the candidate plane normal and
+        ``up_in_cam`` before the plane is accepted as the support
+        surface. Sign of the normal is ignored.
+    """
     if o3d is None:
         raise ImportError("open3d is not installed.")
     if len(pcd.points) == 0:
@@ -161,13 +178,33 @@ def clean_pointcloud(
 
     if remove_plane and len(cleaned.points) >= min_plane_points:
         try:
-            _, inliers = cleaned.segment_plane(
+            plane_model, inliers = cleaned.segment_plane(
                 distance_threshold=float(plane_distance_threshold_m),
                 ransac_n=int(plane_ransac_n),
                 num_iterations=int(plane_num_iterations),
             )
-            # Only drop the plane if it is a meaningful fraction of the cloud.
-            if 0.1 * len(cleaned.points) < len(inliers) < 0.95 * len(cleaned.points):
+            is_support = True
+            if up_in_cam is not None:
+                up = np.asarray(up_in_cam, dtype=np.float64).reshape(3)
+                up_n = np.linalg.norm(up)
+                normal = np.asarray(plane_model[:3], dtype=np.float64)
+                n_n = np.linalg.norm(normal)
+                if up_n > 1e-9 and n_n > 1e-9:
+                    cos_ang = abs(float(np.dot(normal, up) / (n_n * up_n)))
+                    cos_tol = float(np.cos(np.deg2rad(plane_normal_tol_deg)))
+                    is_support = cos_ang >= cos_tol
+                else:
+                    is_support = False
+            # Only drop the plane if it is the support surface (when a
+            # "up" hint was provided) *and* a meaningful fraction of
+            # the cloud. Without the orientation check, RANSAC can
+            # happily latch onto the object's own dominant face --
+            # e.g. the top of a book or the side of a box -- and
+            # delete the object we are trying to localise.
+            if (
+                is_support
+                and 0.1 * len(cleaned.points) < len(inliers) < 0.95 * len(cleaned.points)
+            ):
                 cleaned = cleaned.select_by_index(inliers, invert=True)
         except Exception as exc:
             # RANSAC can fail on degenerate clouds (<3 non-collinear
