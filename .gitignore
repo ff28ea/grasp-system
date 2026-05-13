@@ -14,7 +14,6 @@ venv/
 # Calibration / runtime artefacts (commit only .gitkeep)
 grasp_system/models/*
 !grasp_system/models/.gitkeep
-grasp_system/configs/intrinsics_previews/
 grasp_system/configs/T_eef_cam.npy
 grasp_system/configs/observe_joints.npy
 grasp_system/configs/handeye_report.npz
