@@ -274,11 +274,15 @@ def estimate_pose_from_obb(
         up = np.asarray(up_world_in_cam, dtype=np.float64).reshape(3)
         up /= np.linalg.norm(up) + 1e-12
         # Flip the longest axis so it aligns with the reference direction in xy.
+        # Flipping both col 0 and col 1 keeps the same cross-product
+        # (col2 = col0 x col1), so det is unchanged by this step.
         if R_obb[:, 0] @ up < 0:
             R_obb[:, 0] = -R_obb[:, 0]
-            R_obb[:, 1] = -R_obb[:, 1]  # preserve right-handedness
+            R_obb[:, 1] = -R_obb[:, 1]
 
-    # Ensure right-handed.
+    # Ensure right-handed (the column reorder above can produce det=-1
+    # when the original OBB.R from Open3D was already right-handed but
+    # the argsort permutation was odd).
     if np.linalg.det(R_obb) < 0:
         R_obb[:, 2] = -R_obb[:, 2]
 

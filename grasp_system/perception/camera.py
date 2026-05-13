@@ -222,29 +222,24 @@ class RealSenseCamera:
             raise RuntimeError("Camera is not started; use `with RealSenseCamera()`.")
 
         frames = self._pipeline.wait_for_frames(timeout_ms)
-        # Apply depth-only post-processing *before* alignment. The
-        # RealSense docs recommend this order because alignment
-        # resamples depth onto the color grid, which would otherwise
-        # smear the effect of a spatial filter.
-        if self._depth_filters:
-            depth_frame = frames.get_depth_frame()
-            if depth_frame:
-                for f in self._depth_filters:
-                    depth_frame = f.process(depth_frame)
-                # Reinsert the filtered depth into the composite frame
-                # so ``align.process`` operates on the denoised stream.
-                # Older SDKs expose as_frameset() on the returned frame;
-                # we use it when present, otherwise fall back to the
-                # original frames (no filtering applied).
-                try:
-                    frames = depth_frame.as_frameset()
-                except Exception:  # pragma: no cover - SDK-dependent
-                    pass
+        # Align first, then apply depth-only post-processing to the
+        # aligned depth frame. In principle Intel recommends filtering
+        # *before* alignment, but pyrealsense2 does not expose a
+        # supported way to reinsert a filtered depth frame back into a
+        # composite frameset (``depth_frame.as_frameset()`` does not
+        # exist on a depth_frame), so the previous version silently
+        # skipped filtering whenever any filter was enabled. Filtering
+        # the aligned depth still gives the vast majority of the
+        # denoise benefit -- the alternative "process then align"
+        # pattern requires a software device, which is overkill here.
         aligned = self._align.process(frames)
         color_frame = aligned.get_color_frame()
         depth_frame = aligned.get_depth_frame()
         if not color_frame or not depth_frame:
             raise RuntimeError("Failed to obtain aligned color/depth frames.")
+        if self._depth_filters:
+            for f in self._depth_filters:
+                depth_frame = f.process(depth_frame)
         color = np.asanyarray(color_frame.get_data()).copy()
         depth = np.asanyarray(depth_frame.get_data()).copy()
         return color, depth

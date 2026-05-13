@@ -724,15 +724,14 @@ class PiperController:
         meters here. Negative values (can happen briefly during zero
         calibration) are clamped to 0 so callers don't have to.
         """
-        try:
-            msg = self.raw.GetArmGripperMsgs().gripper_state
-            raw_pos = float(msg.grippers_angle)
-        except AttributeError:
-            # Older SDK exposes ``grippers_angle`` under a slightly
-            # different name -- fall back rather than crashing a
-            # running pipeline.
-            msg = self.raw.GetArmGripperMsgs().gripper_state
-            raw_pos = float(getattr(msg, "gripper_angle", 0.0))
+        msg = self.raw.GetArmGripperMsgs().gripper_state
+        # Newer SDK uses ``grippers_angle``; older versions use
+        # ``gripper_angle``. Try both without re-fetching the message.
+        raw_pos = float(
+            getattr(msg, "grippers_angle", None)
+            if hasattr(msg, "grippers_angle")
+            else getattr(msg, "gripper_angle", 0.0)
+        )
         opening_m = raw_pos / _MM_TO_PIPER_GRIP / 1000.0
         return max(0.0, opening_m)
 

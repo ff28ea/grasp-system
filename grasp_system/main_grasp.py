@@ -349,11 +349,16 @@ def _safe_retreat(
     we start a joint-space motion to the observe pose (joint paths
     don't respect cartesian obstacles).
     """
+    # Use .get() with safe defaults so this function never raises a
+    # KeyError — it runs inside exception handlers where cfg may be
+    # partially initialised.
+    grasp_cfg = cfg.get("grasp", {}) or {}
+    piper_cfg = cfg.get("piper", {}) or {}
+    max_opening = float(grasp_cfg.get("max_opening_m", 0.070))
+    effort = float(piper_cfg.get("default_effort_mNm", 1000.0))
+
     try:
-        piper.open_gripper(
-            opening_m=float(cfg["grasp"]["max_opening_m"]),
-            effort_mNm=float(cfg["piper"]["default_effort_mNm"]),
-        )
+        piper.open_gripper(opening_m=max_opening, effort_mNm=effort)
     except Exception as exc:
         log.warning("safe_retreat: open_gripper failed (%s)", exc)
 
@@ -368,7 +373,7 @@ def _safe_retreat(
         piper.move_to_pose(
             target,
             linear=True,
-            speed_pct=max(5, int(cfg["piper"]["cartesian_move_speed_pct"]) // 2),
+            speed_pct=max(5, int(piper_cfg.get("cartesian_move_speed_pct", 20)) // 2),
             pos_tol_m=float(m_cfg.get("pos_tol_m", 0.003)),
             ang_tol_deg=float(m_cfg.get("ang_tol_deg", 1.0)),
             timeout_s=float(m_cfg.get("cartesian_timeout_s", 8.0)),

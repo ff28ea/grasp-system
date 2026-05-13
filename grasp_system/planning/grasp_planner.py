@@ -215,8 +215,9 @@ def plan_topdown_grasp(
             f"{max_opening_m*1000:.1f} mm"
         )
         # Keep the *real* requested opening in the candidate so the caller
-        # can see the magnitude of the violation. Only clamp it when the
-        # plan is still feasible, to ensure a safe command.
+        # can see the magnitude of the violation. The opening is only
+        # clamped below (in the else branch) when the plan IS feasible,
+        # ensuring we never issue an out-of-range command to the hardware.
     else:
         opening = min(opening, float(max_opening_m))
 
