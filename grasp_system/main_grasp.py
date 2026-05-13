@@ -36,6 +36,7 @@ from .common import (
     load_intrinsics,
     load_npy,
     project_path,
+    rescale_intrinsics,
     validate_transform,
 )
 from .control.piper_controller import PiperController
@@ -992,14 +993,26 @@ def _run_pipeline(
             max_range_mm=max_range_mm,
         )
 
-    # Sanity-check calibration vs. runtime stream.
+    # Sanity-check calibration vs. runtime stream. Previous versions only
+    # logged a warning and then used the calibrated K against a differently
+    # sized image, producing back-projections that were off by the ratio.
+    # Now we rescale the calibrated K (and leave ``dist`` alone, which is
+    # dimensionless) so the pipeline keeps working when the user calibrated
+    # at 1280x720 but runs the live stream at 640x480, or similar.
     rs_intr = cam.intrinsics
     if (rs_intr.width, rs_intr.height) != (intr["width"], intr["height"]):
         log.warning(
             "calibration resolution %dx%d differs from live stream %dx%d; "
-            "consider re-running calibrate_intrinsics at the current settings",
+            "rescaling calibrated K to match the live stream",
             intr["width"], intr["height"], rs_intr.width, rs_intr.height,
         )
+        K_cal = rescale_intrinsics(
+            K_cal,
+            src_size=(intr["width"], intr["height"]),
+            dst_size=(rs_intr.width, rs_intr.height),
+        )
+        intr["width"] = rs_intr.width
+        intr["height"] = rs_intr.height
 
     # 1) observe pose
     _go_to_observe(piper, cfg, log)

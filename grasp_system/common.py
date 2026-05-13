@@ -279,3 +279,62 @@ def load_intrinsics(path: str | Path) -> Dict[str, Any]:
 
 def fx_fy_cx_cy(K: np.ndarray) -> tuple[float, float, float, float]:
     return float(K[0, 0]), float(K[1, 1]), float(K[0, 2]), float(K[1, 2])
+
+
+def rescale_intrinsics(
+    K: np.ndarray,
+    src_size: tuple[int, int],
+    dst_size: tuple[int, int],
+) -> np.ndarray:
+    """Scale a pinhole intrinsic matrix to a different image resolution.
+
+    Calibration runs at one resolution (e.g. 1280x720 for better corner
+    localisation) but the runtime stream may be lower (640x480). The
+    distortion coefficients are dimensionless and need no change, but
+    K is in pixel units and must be linearly rescaled, or every
+    back-projected 3D point will be off by the ratio.
+
+    Uses the simple proportional form
+        fx' = fx * Wdst/Wsrc,  fy' = fy * Hdst/Hsrc
+        cx' = cx * Wdst/Wsrc,  cy' = cy * Hdst/Hsrc
+    without a half-pixel correction. This matches OpenCV's
+    ``cv2.resize`` convention and the RealSense SDK's own resolution
+    downscaling, and is accurate to well within 1 pixel for integer
+    resolution ratios.
+
+    Parameters
+    ----------
+    K:
+        Source 3x3 intrinsic matrix.
+    src_size:
+        ``(width, height)`` of the image K was calibrated at.
+    dst_size:
+        ``(width, height)`` of the image stream K should now apply to.
+
+    Returns
+    -------
+    A *new* 3x3 matrix; the input is not modified. Returns the original
+    matrix unchanged (up to a copy) when ``src_size == dst_size``.
+    """
+    K = np.asarray(K, dtype=np.float64)
+    if K.shape != (3, 3):
+        raise ValueError(f"K must be 3x3, got {K.shape}")
+    sw, sh = int(src_size[0]), int(src_size[1])
+    dw, dh = int(dst_size[0]), int(dst_size[1])
+    if sw <= 0 or sh <= 0 or dw <= 0 or dh <= 0:
+        raise ValueError(
+            f"src/dst sizes must be positive, got src={src_size} dst={dst_size}"
+        )
+    if (sw, sh) == (dw, dh):
+        return K.copy()
+    sx = dw / float(sw)
+    sy = dh / float(sh)
+    K_out = K.copy()
+    K_out[0, 0] *= sx       # fx
+    K_out[1, 1] *= sy       # fy
+    K_out[0, 2] *= sx       # cx
+    K_out[1, 2] *= sy       # cy
+    # Off-diagonal skew (K[0, 1]) stays the same *in pixel units* under
+    # anisotropic scaling only when sx == sy; for safety scale it too.
+    K_out[0, 1] *= sx
+    return K_out
