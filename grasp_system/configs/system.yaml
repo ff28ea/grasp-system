@@ -82,6 +82,22 @@ piper:
   joint_move_speed_pct: 30
   cartesian_move_speed_pct: 20
   default_effort_mNm: 1000
+  # Arm installation orientation. Required on firmware >= V1.5-2 so
+  # gravity compensation and IK are correct. One of:
+  #   horizontal  -- base flat on the table, +z pointing up (the default)
+  #   left        -- base mounted on a vertical wall on the robot's left
+  #   right       -- base mounted on a vertical wall on the robot's right
+  # Set to null to skip the write (e.g. older firmware).
+  installation_pos: horizontal
+  # One-time gripper teach-pendant parameter push. Older systems will
+  # not report gripper feedback or respond to GripperCtrl until these
+  # values have been written to the controller. Toggle `enable: true`
+  # the first time you bring up a brand-new controller; once the values
+  # persist in flash this can be turned off again.
+  gripper_teach_pendant:
+    enable: false
+    stroke_mm: 100          # teach-pendant full stroke
+    max_range_mm: 70        # gripper mechanical max opening
 
 paths:
   intrinsics: configs/camera_intrinsics.npz

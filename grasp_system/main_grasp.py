@@ -389,7 +389,9 @@ def main() -> None:
     )
 
     # -- hardware ------------------------------------------------------
-    can_port = cfg["piper"]["can_port"]
+    piper_cfg = cfg["piper"]
+    can_port = piper_cfg["can_port"]
+    install_pos = piper_cfg.get("installation_pos")
     K_cal = intr["K"]
     dist_cal = intr["dist"]
     with RealSenseCamera(
@@ -400,10 +402,38 @@ def main() -> None:
         align_to=str(cfg["camera"].get("align_to", "color")),
         depth_scale=float(cfg["camera"]["depth_scale"]),
         warmup_frames=int(cfg["camera"].get("warmup_frames", 30)),
-    ) as cam, PiperController(can_port=can_port) as piper:
+    ) as cam, PiperController(
+        can_port=can_port,
+        installation_pos=install_pos,
+    ) as piper:
         # Keep the arm enabled after the process exits. Disabling all joints
         # at shutdown is surprising during bring-up and can make the arm sag.
         piper.disable_on_disconnect = False
+
+        # CAN health check: GetArmJointMsgs will silently return stale
+        # zeros if the reader thread is not actually receiving frames.
+        # Fail loud here rather than moving to a bogus observe pose.
+        if not piper.is_ok():
+            raise RuntimeError(
+                f"CAN reader is not receiving frames on {can_port}; check "
+                "`ip link show {can_port}`, CAN wiring, and that the arm is powered."
+            )
+        log.info("piper CAN fps ~ %.0f Hz", piper.can_fps())
+
+        # Optional first-time gripper parameter push. Safe to re-send on
+        # every run: the controller just writes the same values back.
+        gtp_cfg = piper_cfg.get("gripper_teach_pendant", {}) or {}
+        if gtp_cfg.get("enable", False):
+            stroke_mm = int(gtp_cfg.get("stroke_mm", 100))
+            max_range_mm = int(gtp_cfg.get("max_range_mm", 70))
+            log.info(
+                "pushing gripper teach-pendant params: stroke=%d mm, max_range=%d mm",
+                stroke_mm, max_range_mm,
+            )
+            piper.gripper_teaching_pendant_param_config(
+                teach_pendant_stroke_mm=stroke_mm,
+                max_range_mm=max_range_mm,
+            )
 
         # Sanity-check calibration vs. runtime stream.
         rs_intr = cam.intrinsics
