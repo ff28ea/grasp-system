@@ -15,7 +15,7 @@ pose at the pick point.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Sequence, Tuple
+from typing import Optional, Sequence
 
 import numpy as np
 
@@ -243,7 +243,7 @@ def plan_topdown_grasp(
     return candidate
 
 
-def _check_workspace(candidate: GraspCandidate, workspace: dict) -> Tuple[bool, str]:
+def _check_workspace(candidate: GraspCandidate, workspace: dict) -> tuple[bool, str]:
     """Evaluate geometric guardrails against the grasp / pre / lift poses.
 
     Returns (ok, reason). The reason string is empty on success.
@@ -295,7 +295,7 @@ def align_obb_axes(
     extent_ref: Sequence[float],
     R_src: np.ndarray,
     extent_src: Sequence[float],
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray]:
     """Permute + sign-flip the columns of ``R_src`` to align with ``R_ref``.
 
     OBB axes from PCA are only defined up to a signed permutation. If you
@@ -321,6 +321,19 @@ def align_obb_axes(
     R_ref = np.asarray(R_ref, dtype=np.float64)
     R_src = np.asarray(R_src, dtype=np.float64)
     ext_src = np.asarray(extent_src, dtype=np.float64).reshape(3)
+
+    # Degenerate-extent guard: when all three OBB extents are nearly equal
+    # (e.g. a sphere or a cube viewed from a corner) the axis assignment is
+    # ill-defined—any permutation is equally valid. Skip the expensive
+    # Hungarian matching and return the source unchanged to avoid injecting
+    # a meaningless axis swap that confuses downstream slerp/fusion.
+    mean_ext = float(np.mean(ext_src))
+    if mean_ext > 1e-6 and float(np.ptp(ext_src)) / mean_ext < 0.05:
+        # Ensure right-handedness before returning.
+        R_out = R_src.copy()
+        if np.linalg.det(R_out) < 0:
+            R_out[:, 2] = -R_out[:, 2]
+        return R_out, ext_src.copy()
 
     dots = R_ref.T @ R_src  # (3, 3): row i = ref axis i dotted with each src axis
 

@@ -465,12 +465,21 @@ class PiperController:
         speed_pct = int(max(0, min(100, speed_pct)))
         command_speed = 50 if speed_pct <= 0 else speed_pct
 
+        # Pre-allocate scratch array for the tight polling loop (~200 Hz)
+        # to avoid per-iteration heap allocations from _wrap_deg.
+        _diff = np.empty(6, dtype=np.float64)
+
         t0 = time.time()
         while time.time() - t0 < timeout_s:
             self.raw.MotionCtrl_2(0x01, MOVE_J, command_speed, 0x00)
             self.raw.JointCtrl(*target_units)
             cur = self.get_joints_deg()
-            if np.max(np.abs(_wrap_deg(cur - target_deg))) <= tol_deg:
+            np.subtract(cur, target_deg, out=_diff)
+            np.add(_diff, 180.0, out=_diff)
+            np.mod(_diff, 360.0, out=_diff)
+            np.subtract(_diff, 180.0, out=_diff)
+            np.abs(_diff, out=_diff)
+            if float(_diff.max()) <= tol_deg:
                 return True
             time.sleep(command_period_s)
         return False
@@ -680,10 +689,16 @@ class PiperController:
         poll_s: float = 0.05,
     ) -> bool:
         target_deg = np.rad2deg(np.asarray(target_rad, dtype=np.float64))
+        _diff = np.empty(6, dtype=np.float64)
         t0 = time.time()
         while time.time() - t0 < timeout_s:
             cur = self.get_joints_deg()
-            if np.max(np.abs(_wrap_deg(cur - target_deg))) <= tol_deg:
+            np.subtract(cur, target_deg, out=_diff)
+            np.add(_diff, 180.0, out=_diff)
+            np.mod(_diff, 360.0, out=_diff)
+            np.subtract(_diff, 180.0, out=_diff)
+            np.abs(_diff, out=_diff)
+            if float(_diff.max()) <= tol_deg:
                 return True
             time.sleep(poll_s)
         return False

@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional
+from typing import Optional
 
 import cv2
 import numpy as np
@@ -91,7 +91,7 @@ class SegmentationDetector:
         min_pixels: int = 0,
         mask_erode_px: int = 0,
         target_hw: Optional[tuple[int, int]] = None,
-    ) -> List[Detection]:
+    ) -> list[Detection]:
         """Run segmentation on ``image_bgr`` and return detections.
 
         Parameters
@@ -113,7 +113,7 @@ class SegmentationDetector:
             verbose=False,
         )[0]
 
-        detections: List[Detection] = []
+        detections: list[Detection] = []
         if res.masks is None or res.boxes is None:
             return detections
 
@@ -130,6 +130,13 @@ class SegmentationDetector:
         # to the requested target grid (where we will store the mask).
         sx = W_tgt / float(W_img)
         sy = H_tgt / float(H_img)
+
+        # Pre-build the erosion kernel once outside the loop (identical for
+        # every detection in a single predict() call).
+        erode_kernel = None
+        if mask_erode_px > 0:
+            k = 2 * int(mask_erode_px) + 1
+            erode_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
 
         for m, xyxy, cid, score in zip(masks, boxes, classes, scores):
             if m.shape != (H_tgt, W_tgt):
@@ -151,11 +158,9 @@ class SegmentationDetector:
                 dtype=np.float64,
             )
 
-            if mask_erode_px > 0:
-                k = 2 * int(mask_erode_px) + 1
-                kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+            if erode_kernel is not None:
                 mask_resized = cv2.erode(
-                    mask_resized.astype(np.uint8), kernel
+                    mask_resized.astype(np.uint8), erode_kernel
                 ).astype(bool)
 
             if mask_resized.sum() < min_pixels:
@@ -179,7 +184,7 @@ class SegmentationDetector:
 
         return detections
 
-    def best(self, detections: List[Detection]) -> Optional[Detection]:
+    def best(self, detections: list[Detection]) -> Optional[Detection]:
         if not detections:
             return None
         return max(detections, key=lambda d: d.confidence)

@@ -21,7 +21,7 @@ import argparse
 import sys
 import time
 from pathlib import Path
-from typing import List, Optional
+from typing import Optional
 
 import cv2
 import numpy as np
@@ -49,8 +49,8 @@ def run(
     log = get_logger("calib-intr")
     objp = _build_object_points(pattern, square)
 
-    obj_points: List[np.ndarray] = []
-    img_points: List[np.ndarray] = []
+    obj_points: list[np.ndarray] = []
+    img_points: list[np.ndarray] = []
     subpix_crit = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 1e-3)
     last_auto_capture = 0.0
     last_status = 0.0

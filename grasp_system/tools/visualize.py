@@ -18,7 +18,7 @@ work, and the 3D functions raise a clear ImportError only when called.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Iterable, List, Optional, Sequence
+from typing import Iterable, Optional, Sequence
 
 import cv2
 import numpy as np

@@ -188,3 +188,20 @@ paths:
   dataset: datasets/my_first_project_v3i_yolov8/data.yaml
   model: models/best.pt
   classes: configs/classes.yaml
+
+# Pipeline timing delays (seconds). Centralised here so they can be
+# tuned from a single place instead of being scattered as hard-coded
+# magic numbers throughout main_grasp.py.
+timing:
+  # Settle time after reaching observe pose before capturing a frame.
+  observe_settle_s: 0.5
+  # Settle time after active-perception close-up move.
+  active_settle_s: 0.4
+  # Delay after opening the gripper before the next move.
+  gripper_open_settle_s: 0.3
+  # Delay after reaching a waypoint before the next command.
+  waypoint_settle_s: 0.2
+  # Delay after releasing at the place pose.
+  place_release_s: 0.5
+  # Delay between perception retries.
+  retry_delay_s: 0.3

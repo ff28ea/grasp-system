@@ -16,7 +16,7 @@ a target template point cloud is provided.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Optional
 
 import numpy as np
 
@@ -117,9 +117,11 @@ def backproject_mask_to_pointcloud(
 
     pts = np.stack([x, y, z], axis=1)
 
-    # Colors: convert BGR uint8 -> RGB float in [0, 1]
-    rgb = color_bgr[..., ::-1].astype(np.float32) / 255.0
-    colors = rgb[valid]
+    # Colors: extract only masked pixels first, then BGR -> RGB + normalize.
+    # Avoids a full-image copy+flip that is wasteful when the mask covers <5%
+    # of pixels (the common case for single-object segmentation).
+    colors_bgr = color_bgr[valid].astype(np.float32) / 255.0
+    colors = colors_bgr[:, ::-1]  # BGR -> RGB on masked subset only
 
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(pts.astype(np.float64))
@@ -305,7 +307,7 @@ def refine_with_icp(
     target: "o3d.geometry.PointCloud",
     voxel_size_m: float = 0.003,
     max_correspondence_m: Optional[float] = None,
-) -> Tuple[np.ndarray, float, float]:
+) -> tuple[np.ndarray, float, float]:
     """FPFH + point-to-plane ICP refinement.
 
     Returns

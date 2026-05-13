@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Optional
 
 import numpy as np
 import yaml
@@ -43,19 +43,19 @@ def get_logger(name: str = "grasp", level: int = logging.INFO) -> logging.Logger
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-def load_config(path: str | Path = "configs/system.yaml") -> Dict[str, Any]:
+def load_config(path: str | Path = "configs/system.yaml") -> dict[str, Any]:
     p = project_path(path)
     with open(p, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
 
 
-def load_classes(path: str | Path = "configs/classes.yaml") -> Dict[int, Dict[str, Any]]:
+def load_classes(path: str | Path = "configs/classes.yaml") -> dict[int, dict[str, Any]]:
     p = project_path(path)
     with open(p, "r", encoding="utf-8") as f:
         data = yaml.safe_load(f) or {}
     raw = data.get("classes", {}) or {}
     # Normalise keys to int.
-    out: Dict[int, Dict[str, Any]] = {}
+    out: dict[int, dict[str, Any]] = {}
     for k, v in raw.items():
         out[int(k)] = v
     return out
@@ -221,7 +221,7 @@ def load_npy(path: str | Path) -> np.ndarray:
     return np.load(path, allow_pickle=False)
 
 
-def load_intrinsics(path: str | Path) -> Dict[str, Any]:
+def load_intrinsics(path: str | Path) -> dict[str, Any]:
     """Load camera intrinsics saved by calibrate_intrinsics.py.
 
     Validates shape, dtype, and basic plausibility (fx > 0, image size
@@ -259,6 +259,10 @@ def load_intrinsics(path: str | Path) -> Dict[str, Any]:
     # cv2.calibrateHandEye, etc.) receive a consistent shape without
     # having to call reshape themselves.
     dist = dist.reshape(-1)
+    # Ensure C-contiguous layout: some OpenCV functions (e.g.
+    # cv2.undistortPoints, cv2.calibrateHandEye) silently produce
+    # wrong results or raise when passed a non-contiguous array.
+    dist = np.ascontiguousarray(dist)
     if dist.size not in (4, 5, 8, 12, 14):
         raise ValueError(
             f"intrinsics dist has {dist.size} coefficients; expected "
@@ -274,7 +278,7 @@ def load_intrinsics(path: str | Path) -> Dict[str, Any]:
             f"intrinsics image size {width}x{height} is non-positive"
         )
 
-    out: Dict[str, Any] = {"K": K, "dist": dist, "width": width, "height": height}
+    out: dict[str, Any] = {"K": K, "dist": dist, "width": width, "height": height}
     if "rms" in data.files:
         out["rms"] = float(data["rms"])
     return out
