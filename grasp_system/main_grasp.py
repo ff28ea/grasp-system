@@ -51,6 +51,19 @@ from .planning.grasp_planner import (
     fuse_poses,
     plan_topdown_grasp,
 )
+from .tools.visualize import (
+    build_scene_geometries,
+    make_detection_overlay,
+    save_image,
+    save_pointcloud,
+    save_poses_npz,
+    show_scene,
+)
+
+try:  # open3d is optional at import time; only needed if visualization is requested
+    import open3d as o3d
+except ImportError:  # pragma: no cover
+    o3d = None  # type: ignore[assignment]
 
 
 # ---------------------------------------------------------------------------
@@ -126,7 +139,10 @@ def _perceive_object_in_camera(
         raise RuntimeError("cleaned point cloud too sparse")
 
     pose = estimate_pose_from_obb(pcd)
-    return det, pose
+    # Return the raw color image and the cleaned point cloud alongside the
+    # pose so downstream visualization has access to the same data the
+    # estimator used. Cheap: both are already in memory.
+    return det, pose, color, pcd
 
 
 # ---------------------------------------------------------------------------
@@ -182,11 +198,11 @@ def _snapshot_T_B_O(
     # Ensure arm is fully settled so the end-pose feedback matches the frame.
     time.sleep(float(cfg["handeye"].get("settle_time_s", 1.0)) * 0.5)
     T_B_E = piper.get_end_pose_matrix()
-    det, pose_cam = _perceive_object_in_camera(
+    det, pose_cam, color, pcd_cam = _perceive_object_in_camera(
         cam, detector, cfg, target_class, log, K=K, dist=dist
     )
     T_B_O = T_B_E @ T_E_C @ pose_cam.T_C_O
-    return det, pose_cam, T_B_E, T_B_O
+    return det, pose_cam, T_B_E, T_B_O, color, pcd_cam
 
 
 def _active_perception_close_up(
@@ -335,6 +351,113 @@ def _execute_grasp(
 
 
 # ---------------------------------------------------------------------------
+# Visualization helpers
+# ---------------------------------------------------------------------------
+def _save_perception_snapshot(
+    out_dir: Path,
+    tag: str,
+    color: np.ndarray,
+    det: Detection,
+    pose_cam,
+    pcd_cam,
+    T_B_E: np.ndarray,
+    T_E_C: np.ndarray,
+    K: np.ndarray,
+    log,
+) -> None:
+    """Dump an annotated image + point cloud (in base frame) + transforms.
+
+    ``tag`` becomes the filename stem: ``detection_<tag>.jpg``,
+    ``cloud_<tag>.ply``, ``poses_<tag>.npz``. Called once per perception
+    phase (rough / fine).
+    """
+    overlay = make_detection_overlay(
+        color,
+        det,
+        center_cam=pose_cam.center,
+        R_cam=pose_cam.R,
+        extent=pose_cam.extent,
+        K=K,
+        title=f"{tag}: {det.label or det.class_id} conf={det.confidence:.2f}",
+    )
+    img_path = save_image(out_dir / f"detection_{tag}.jpg", overlay)
+    log.info("viz: wrote %s", img_path)
+
+    if o3d is not None and pcd_cam is not None and len(pcd_cam.points) > 0:
+        # Express the cloud in the base frame so all phases share a common
+        # coordinate system (easier to diff rough vs. fine in a PLY viewer).
+        T_B_C = T_B_E @ T_E_C
+        pcd_base = o3d.geometry.PointCloud(pcd_cam)
+        pcd_base.transform(T_B_C)
+        cloud_path = save_pointcloud(out_dir / f"cloud_{tag}.ply", pcd_base)
+        if cloud_path is not None:
+            log.info("viz: wrote %s", cloud_path)
+
+    T_B_O = T_B_E @ T_E_C @ pose_cam.T_C_O
+    save_poses_npz(
+        out_dir / f"poses_{tag}.npz",
+        T_B_E=T_B_E,
+        T_E_C=T_E_C,
+        T_C_O=pose_cam.T_C_O,
+        T_B_O=T_B_O,
+        extent=pose_cam.extent,
+        K=K,
+    )
+
+
+def _save_plan_artifacts(
+    out_dir: Path,
+    T_B_O_final: np.ndarray,
+    extent_final,
+    grasp: GraspCandidate,
+    place_pose_base: Optional[np.ndarray],
+    log,
+) -> None:
+    save_poses_npz(
+        out_dir / "plan.npz",
+        T_B_O_final=T_B_O_final,
+        extent_final=np.asarray(extent_final, dtype=np.float64),
+        T_B_grasp=grasp.T_B_grasp,
+        T_B_pregrasp=grasp.pre_grasp,
+        T_B_lift=grasp.lift,
+        opening_m=np.array([grasp.opening_m, grasp.close_opening_m, grasp.object_width_m]),
+        place_pose_base=place_pose_base,
+    )
+    log.info("viz: wrote %s", out_dir / "plan.npz")
+
+
+def _show_plan_3d(
+    pcd_cam,
+    T_B_E: np.ndarray,
+    T_E_C: np.ndarray,
+    T_B_O_final: np.ndarray,
+    extent_final,
+    grasp: GraspCandidate,
+    place_pose_base: Optional[np.ndarray],
+    log,
+) -> None:
+    """Blocking Open3D preview of the full plan in the base frame."""
+    if o3d is None:
+        log.warning("open3d not installed; skipping interactive 3D preview")
+        return
+    pcd_base = None
+    if pcd_cam is not None and len(pcd_cam.points) > 0:
+        pcd_base = o3d.geometry.PointCloud(pcd_cam)
+        pcd_base.transform(T_B_E @ T_E_C)
+    geoms = build_scene_geometries(
+        scene_pcd_base=pcd_base,
+        T_B_O=T_B_O_final,
+        extent=extent_final,
+        T_B_grasp=grasp.T_B_grasp,
+        T_B_pregrasp=grasp.pre_grasp,
+        T_B_lift=grasp.lift,
+        T_B_place=place_pose_base,
+    )
+    log.info("viz: opening 3D preview (close window to continue)")
+    show_scene(geoms, window_name="grasp plan (base frame)")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def main() -> None:
@@ -356,10 +479,36 @@ def main() -> None:
         action="store_true",
         help="perceive + plan but do not move the arm during the grasp",
     )
+    ap.add_argument(
+        "--visualize",
+        action="store_true",
+        help="write detection overlays, point clouds, and poses to --viz-dir",
+    )
+    ap.add_argument(
+        "--viz-dir",
+        type=Path,
+        default=Path("runs/grasp_viz"),
+        help="output directory for visualization artifacts (implies --visualize)",
+    )
+    ap.add_argument(
+        "--viz-3d",
+        action="store_true",
+        help="open an interactive Open3D preview of the plan before motion",
+    )
     args = ap.parse_args()
 
     log = get_logger("main")
     cfg = load_config(args.config)
+
+    # Visualization artifacts (images / PLYs / npz) are written only when
+    # --visualize is set. --viz-3d alone just opens the interactive
+    # preview without touching the filesystem. Both flags keep the color
+    # frame + cleaned cloud around from each perception phase.
+    viz_dir: Optional[Path] = None
+    if args.visualize:
+        viz_dir = args.viz_dir
+        viz_dir.mkdir(parents=True, exist_ok=True)
+        log.info("viz: artifacts -> %s", viz_dir.resolve())
 
     # -- load calibration artefacts ------------------------------------
     T_E_C = load_npy(project_path(cfg["paths"]["t_eef_cam"]))
@@ -448,7 +597,7 @@ def main() -> None:
         _go_to_observe(piper, cfg, log)
 
         # 2) rough perception
-        det, pose_cam_rough, _, T_B_O_rough = _snapshot_T_B_O(
+        det, pose_cam_rough, T_B_E_rough, T_B_O_rough, color_rough, pcd_rough_cam = _snapshot_T_B_O(
             piper, cam, detector, cfg, args.target_class, T_E_C, log,
             K=K_cal, dist=dist_cal,
         )
@@ -456,25 +605,47 @@ def main() -> None:
             "T_B_O (rough) translation: %s",
             np.array2string(T_B_O_rough[:3, 3], precision=4),
         )
+        if viz_dir is not None:
+            _save_perception_snapshot(
+                viz_dir, "rough", color_rough, det, pose_cam_rough,
+                pcd_rough_cam, T_B_E_rough, T_E_C, K_cal, log,
+            )
+
+        # Track the freshest scene cloud + EEF pose so the final 3D preview
+        # can be in the same frame as the grasp plan. Active perception
+        # overwrites these if it succeeds.
+        color_best = color_rough
+        pcd_best_cam = pcd_rough_cam
+        T_B_E_best = T_B_E_rough
 
         # 3) optional close-up active perception
         T_B_O_final = T_B_O_rough
         extent_final = pose_cam_rough.extent
         if cfg["active_perception"].get("enable", True) and not args.no_active_perception:
             try:
-                det_f, pose_cam_fine, _, T_B_O_fine = _active_perception_close_up(
-                    piper,
-                    cam,
-                    detector,
-                    cfg,
-                    T_E_C,
-                    T_B_O_rough,
-                    pose_cam_rough.extent,
-                    args.target_class,
-                    log,
-                    K=K_cal,
-                    dist=dist_cal,
+                det_f, pose_cam_fine, T_B_E_fine, T_B_O_fine, color_fine, pcd_fine_cam = (
+                    _active_perception_close_up(
+                        piper,
+                        cam,
+                        detector,
+                        cfg,
+                        T_E_C,
+                        T_B_O_rough,
+                        pose_cam_rough.extent,
+                        args.target_class,
+                        log,
+                        K=K_cal,
+                        dist=dist_cal,
+                    )
                 )
+                if viz_dir is not None:
+                    _save_perception_snapshot(
+                        viz_dir, "fine", color_fine, det_f, pose_cam_fine,
+                        pcd_fine_cam, T_B_E_fine, T_E_C, K_cal, log,
+                    )
+                color_best = color_fine
+                pcd_best_cam = pcd_fine_cam
+                T_B_E_best = T_B_E_fine
                 ap_cfg = cfg["active_perception"]
                 # Align the fine OBB axes to the rough ones *before* fusing,
                 # so that fuse_poses blends rotations that mean the same
@@ -528,13 +699,12 @@ def main() -> None:
             log.error("aborting: %s", grasp.reason)
             return
 
-        if args.dry_run:
-            log.info("dry-run; skipping motion")
-            return
-
         # 5) Build place pose from config. Position comes from ``place.xyz_m``;
         # the orientation is an independent top-down frame (not copied from the
         # grasp R, since a tilted grasp would then drop the object sideways).
+        # We build it here (before the dry-run short-circuit) so visualization
+        # can include the place frame, and so the final 3D preview matches
+        # what will actually be executed.
         place_cfg = cfg.get("place", {}) or {}
         place_xyz = place_cfg.get("xyz_m", [0.30, -0.15, 0.18])
         place_R = camera_look_down_rotation(
@@ -544,6 +714,20 @@ def main() -> None:
         place = np.eye(4)
         place[:3, :3] = place_R
         place[:3, 3] = [float(x) for x in place_xyz]
+
+        # Plan visualization: on-disk artifacts + optional interactive preview.
+        # Done before motion so a bad plan can be caught at a glance.
+        if viz_dir is not None:
+            _save_plan_artifacts(viz_dir, T_B_O_final, extent_final, grasp, place, log)
+        if args.viz_3d:
+            _show_plan_3d(
+                pcd_best_cam, T_B_E_best, T_E_C,
+                T_B_O_final, extent_final, grasp, place, log,
+            )
+
+        if args.dry_run:
+            log.info("dry-run; skipping motion")
+            return
 
         _execute_grasp(piper, cfg, grasp, place_pose_base=place, log=log)
 
