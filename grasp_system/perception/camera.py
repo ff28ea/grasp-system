@@ -7,7 +7,7 @@ image in BGR (uint8) and an aligned depth image in millimeters (uint16).
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Optional
 
 import numpy as np
 
@@ -32,7 +32,7 @@ class CameraIntrinsics:
     cx: float
     cy: float
     model: str = "pinhole"
-    coeffs: Tuple[float, ...] = (0.0, 0.0, 0.0, 0.0, 0.0)
+    coeffs: tuple[float, ...] = (0.0, 0.0, 0.0, 0.0, 0.0)
 
     @property
     def K(self) -> np.ndarray:
@@ -221,7 +221,7 @@ class RealSenseCamera:
     # -- I/O ------------------------------------------------------------
     def grab_aligned(
         self, timeout_ms: int = 2000
-    ) -> Tuple[np.ndarray, np.ndarray]:
+    ) -> tuple[np.ndarray, np.ndarray]:
         """Return (color_bgr uint8, depth_mm uint16).
 
         Both images share the color-stream intrinsics after alignment.

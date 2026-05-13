@@ -32,7 +32,6 @@ import argparse
 import sys
 import time
 from pathlib import Path
-from typing import List, Tuple
 
 import cv2
 import numpy as np
@@ -58,7 +57,7 @@ _HANDEYE_METHODS = {
 }
 
 
-def _build_object_points(pattern: Tuple[int, int], square: float) -> np.ndarray:
+def _build_object_points(pattern: tuple[int, int], square: float) -> np.ndarray:
     objp = np.zeros((pattern[0] * pattern[1], 3), np.float32)
     objp[:, :2] = np.mgrid[0 : pattern[0], 0 : pattern[1]].T.reshape(-1, 2) * square
     return objp
@@ -66,7 +65,7 @@ def _build_object_points(pattern: Tuple[int, int], square: float) -> np.ndarray:
 
 def _detect_chessboard(
     color: np.ndarray,
-    pattern: Tuple[int, int],
+    pattern: tuple[int, int],
     objp: np.ndarray,
     K: np.ndarray,
     dist: np.ndarray,
@@ -96,12 +95,12 @@ def _detect_chessboard(
 def _collect_poses(
     cfg: dict,
     num_poses: int,
-    pattern: Tuple[int, int],
+    pattern: tuple[int, int],
     square: float,
     intrinsics_path: Path,
     settle_s: float,
-) -> Tuple[
-    List[np.ndarray], List[np.ndarray], List[np.ndarray], List[np.ndarray]
+) -> tuple[
+    list[np.ndarray], list[np.ndarray], list[np.ndarray], list[np.ndarray]
 ]:
     log = get_logger("handeye")
     intr = load_intrinsics(intrinsics_path)
@@ -109,10 +108,10 @@ def _collect_poses(
     dist = intr["dist"]
     objp = _build_object_points(pattern, square)
 
-    R_g2b: List[np.ndarray] = []
-    t_g2b: List[np.ndarray] = []
-    R_t2c: List[np.ndarray] = []
-    t_t2c: List[np.ndarray] = []
+    R_g2b: list[np.ndarray] = []
+    t_g2b: list[np.ndarray] = []
+    R_t2c: list[np.ndarray] = []
+    t_t2c: list[np.ndarray] = []
     window_name = "handeye eye-in-hand"
     mouse_capture_requested = False
 
@@ -190,10 +189,10 @@ def _collect_poses(
 
 
 def _solve(
-    R_g2b: List[np.ndarray],
-    t_g2b: List[np.ndarray],
-    R_t2c: List[np.ndarray],
-    t_t2c: List[np.ndarray],
+    R_g2b: list[np.ndarray],
+    t_g2b: list[np.ndarray],
+    R_t2c: list[np.ndarray],
+    t_t2c: list[np.ndarray],
     method: int,
 ) -> np.ndarray:
     R_c2g, t_c2g = cv2.calibrateHandEye(
@@ -208,11 +207,11 @@ def _solve(
 
 def _consistency_report(
     T_EC: np.ndarray,
-    R_g2b: List[np.ndarray],
-    t_g2b: List[np.ndarray],
-    R_t2c: List[np.ndarray],
-    t_t2c: List[np.ndarray],
-) -> Tuple[np.ndarray, np.ndarray]:
+    R_g2b: list[np.ndarray],
+    t_g2b: list[np.ndarray],
+    R_t2c: list[np.ndarray],
+    t_t2c: list[np.ndarray],
+) -> tuple[np.ndarray, np.ndarray]:
     """Compute the position of the board origin in the base frame for each
     pose; a perfect calibration would put them all at the same point."""
     positions = []
