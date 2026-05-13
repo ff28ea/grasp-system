@@ -52,6 +52,7 @@ from .planning.grasp_planner import (
     fuse_poses,
     plan_topdown_grasp,
 )
+from .perception.pose_estimator import refine_with_icp  # noqa: F401 (used conditionally)
 from .tools.visualize import (
     build_scene_geometries,
     make_detection_overlay,
@@ -80,6 +81,101 @@ def _up_direction_in_cam(T_B_E: np.ndarray, T_E_C: np.ndarray) -> np.ndarray:
     T_B_C = T_B_E @ T_E_C
     R_C_B = T_B_C[:3, :3].T     # cam <- base rotation (orthonormal)
     return R_C_B @ np.array([0.0, 0.0, 1.0], dtype=np.float64)
+
+
+def _refine_pose_with_icp_if_enabled(
+    pcd_cam,
+    pose_cam,
+    cfg: dict,
+    classes: dict,
+    class_id: int,
+    log,
+):
+    """Optionally refine ``pose_cam.T_C_O`` by ICP against a class template.
+
+    Returns the (possibly-updated) ``pose_cam`` or the original when
+    ICP is disabled, the template is missing, or the fit is poor.
+
+    Activation requires *all* of:
+      * ``perception.icp.enable: true`` in ``system.yaml``
+      * a per-class ``template_ply`` path in ``classes.yaml`` that
+        resolves to a non-empty point cloud
+      * a successful ICP run with ``fitness >= fitness_threshold`` and
+        ``inlier_rmse <= inlier_rmse_threshold_m``.
+
+    This makes the refinement strictly opt-in: the default behaviour
+    after enabling ``icp`` is unchanged for classes without a template.
+    """
+    icp_cfg = cfg.get("perception", {}).get("icp", {}) or {}
+    if not bool(icp_cfg.get("enable", False)):
+        return pose_cam
+    if o3d is None:
+        log.warning("ICP requested but open3d is not installed; skipping")
+        return pose_cam
+
+    cinfo = classes.get(class_id, {}) or {}
+    template_rel = cinfo.get("template_ply")
+    if not template_rel:
+        # No template for this class -> nothing to align against. The
+        # OBB pose is still perfectly usable; this branch exists so
+        # users can mix templated and non-templated classes in one
+        # config.
+        return pose_cam
+
+    template_path = project_path(template_rel)
+    if not template_path.exists():
+        log.warning(
+            "class %d template %s missing; skipping ICP", class_id, template_path,
+        )
+        return pose_cam
+
+    try:
+        template = o3d.io.read_point_cloud(str(template_path))
+    except Exception as exc:
+        log.warning("failed to read template %s: %s; skipping ICP", template_path, exc)
+        return pose_cam
+    if len(template.points) == 0:
+        log.warning("template %s has no points; skipping ICP", template_path)
+        return pose_cam
+
+    # The template is assumed to be expressed in the *object* frame
+    # (origin at the object center, axes aligned with the OBB). We
+    # align the observed scene cloud to the template-in-camera-frame by
+    # transforming the template with the current pose guess.
+    template_in_cam = o3d.geometry.PointCloud(template)
+    template_in_cam.transform(pose_cam.T_C_O)
+
+    try:
+        T_delta, fitness, rmse = refine_with_icp(
+            template_in_cam,
+            pcd_cam,
+            voxel_size_m=float(icp_cfg.get("voxel_size_m", 0.003)),
+        )
+    except Exception as exc:
+        log.warning("ICP raised %s; keeping OBB pose", exc)
+        return pose_cam
+
+    min_fit = float(icp_cfg.get("fitness_threshold", 0.6))
+    max_rmse = float(icp_cfg.get("inlier_rmse_threshold_m", 0.005))
+    log.info("ICP: fitness=%.3f rmse=%.4f m", fitness, rmse)
+    if fitness < min_fit or rmse > max_rmse:
+        log.warning(
+            "ICP quality below thresholds (fit>=%.2f, rmse<=%.3f m); "
+            "falling back to OBB pose", min_fit, max_rmse,
+        )
+        return pose_cam
+
+    # ``T_delta`` takes the template-in-cam (pose guess) to the observed
+    # cloud in cam. Compose with the OBB pose to get the refined T_C_O.
+    T_C_O_refined = T_delta @ pose_cam.T_C_O
+    # Return a shallow copy so we don't mutate the estimator's output.
+    import dataclasses
+    return dataclasses.replace(
+        pose_cam,
+        T_C_O=T_C_O_refined,
+        icp_fitness=float(fitness),
+        icp_inlier_rmse=float(rmse),
+    )
 
 
 def _resolve_target_class(
@@ -172,6 +268,7 @@ def _perceive_object_in_camera(
 
     so = p_cfg["statistical_outlier"]
     plane = p_cfg["plane_segmentation"]
+    ro_cfg = p_cfg.get("radius_outlier", {}) or {}
     pcd = clean_pointcloud(
         pcd_raw,
         voxel_size_m=float(p_cfg["voxel_size_m"]),
@@ -183,6 +280,8 @@ def _perceive_object_in_camera(
         plane_num_iterations=int(plane["num_iterations"]),
         up_in_cam=up_in_cam,
         plane_normal_tol_deg=float(plane.get("normal_tol_deg", 25.0)),
+        radius_outlier_nb_points=int(ro_cfg.get("nb_points", 0)),
+        radius_outlier_radius_m=float(ro_cfg.get("radius_m", 0.01)),
     )
     if len(pcd.points) < 20:
         raise RuntimeError(
@@ -285,6 +384,7 @@ def _snapshot_T_B_O(
     target_class: Optional[int],
     T_E_C: np.ndarray,
     log,
+    classes: Optional[dict] = None,
     K: Optional[np.ndarray] = None,
     dist: Optional[np.ndarray] = None,
     retries: int = 2,
@@ -318,6 +418,14 @@ def _snapshot_T_B_O(
     else:  # pragma: no cover - defensive
         raise RuntimeError(f"perception failed after retries: {last_exc}")
 
+    # Optional ICP refinement when the class has a template point cloud.
+    # No-op when perception.icp.enable is false (the default), so this
+    # change does not alter existing behaviour.
+    if classes is not None:
+        pose_cam = _refine_pose_with_icp_if_enabled(
+            pcd_cam, pose_cam, cfg, classes, det.class_id, log,
+        )
+
     T_B_O = T_B_E @ T_E_C @ pose_cam.T_C_O
     return det, pose_cam, T_B_E, T_B_O, color, pcd_cam
 
@@ -332,6 +440,7 @@ def _active_perception_close_up(
     extent_rough: np.ndarray,
     target_class: Optional[int],
     log,
+    classes: Optional[dict] = None,
     K: Optional[np.ndarray] = None,
     dist: Optional[np.ndarray] = None,
 ):
@@ -394,7 +503,8 @@ def _active_perception_close_up(
     time.sleep(0.4)
 
     return _snapshot_T_B_O(
-        piper, cam, detector, cfg, target_class, T_E_C, log, K=K, dist=dist
+        piper, cam, detector, cfg, target_class, T_E_C, log,
+        classes=classes, K=K, dist=dist,
     )
 
 
@@ -405,6 +515,19 @@ def _execute_grasp(
     place_pose_base: Optional[np.ndarray],
     log,
 ) -> None:
+    # Re-check CAN health at the start of the motion phase. The rough
+    # + fine perception easily takes 10-30 s, during which the bus
+    # could have silently degraded (e.g. USB power-management on the
+    # CAN adapter, a cable wiggle on a real workbench). We do not want
+    # to send MOVE_L commands into a half-dead link.
+    min_fps = float(cfg.get("motion", {}).get("min_can_fps", 50.0))
+    if not piper.is_ok() or piper.can_fps() < min_fps:
+        raise RuntimeError(
+            f"CAN link degraded before grasp execution: ok={piper.is_ok()}, "
+            f"fps={piper.can_fps():.0f} (min {min_fps:.0f}). "
+            "Check cabling / power before retrying."
+        )
+
     g_cfg = cfg["grasp"]
     speed_cart = int(cfg["piper"]["cartesian_move_speed_pct"])
     effort_mNm = float(cfg["piper"]["default_effort_mNm"])
@@ -766,6 +889,9 @@ def main() -> None:
         align_to=str(cfg["camera"].get("align_to", "color")),
         depth_scale=float(cfg["camera"]["depth_scale"]),
         warmup_frames=int(cfg["camera"].get("warmup_frames", 30)),
+        spatial_filter=bool(cfg["camera"].get("spatial_filter", False)),
+        temporal_filter=bool(cfg["camera"].get("temporal_filter", False)),
+        hole_filling_filter=bool(cfg["camera"].get("hole_filling_filter", False)),
     ) as cam, PiperController(
         can_port=can_port,
         installation_pos=install_pos,
@@ -881,6 +1007,7 @@ def _run_pipeline(
     # 2) rough perception
     det, pose_cam_rough, T_B_E_rough, T_B_O_rough, color_rough, pcd_rough_cam = _snapshot_T_B_O(
         piper, cam, detector, cfg, target_class, T_E_C, log,
+        classes=classes,
         K=K_cal, dist=dist_cal,
         retries=int(cfg.get("perception", {}).get("retries", 2)),
     )
@@ -916,6 +1043,7 @@ def _run_pipeline(
                     pose_cam_rough.extent,
                     target_class,
                     log,
+                    classes=classes,
                     K=K_cal,
                     dist=dist_cal,
                 )

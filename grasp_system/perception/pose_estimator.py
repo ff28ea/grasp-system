@@ -138,6 +138,8 @@ def clean_pointcloud(
     min_plane_points: int = 300,
     up_in_cam: Optional[np.ndarray] = None,
     plane_normal_tol_deg: float = 25.0,
+    radius_outlier_nb_points: int = 0,
+    radius_outlier_radius_m: float = 0.01,
 ) -> "o3d.geometry.PointCloud":
     """Statistical outlier removal + voxel downsample + optional plane removal.
 
@@ -154,6 +156,16 @@ def clean_pointcloud(
         Tolerance (degrees) between the candidate plane normal and
         ``up_in_cam`` before the plane is accepted as the support
         surface. Sign of the normal is ignored.
+    radius_outlier_nb_points:
+        If > 0, run ``remove_radius_outlier`` as a second cleaning
+        pass, keeping only points that have at least this many
+        neighbours within ``radius_outlier_radius_m``. This is stricter
+        than statistical outlier removal and helps kill the isolated
+        "flying pixels" left over from D435i mask edges, which SOR
+        tends to keep because they come in small clusters. Set to 0
+        (default) to skip.
+    radius_outlier_radius_m:
+        Neighbour search radius (m) for the radius outlier filter.
     """
     if o3d is None:
         raise ImportError("open3d is not installed.")
@@ -212,6 +224,19 @@ def clean_pointcloud(
             # rather than aborting, but tell the user so they can tune
             # voxel_size / outlier params.
             _log.warning("plane segmentation failed: %s", exc)
+
+    # Optional second outlier pass. Run *after* plane removal because
+    # the supporting surface hugely inflates each point's neighbour
+    # count and would cause false positives; once the table is gone,
+    # the only remaining "lonely" points are genuine flying pixels.
+    if radius_outlier_nb_points > 0 and len(cleaned.points) > 0:
+        try:
+            cleaned, _ = cleaned.remove_radius_outlier(
+                nb_points=int(radius_outlier_nb_points),
+                radius=float(radius_outlier_radius_m),
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            _log.warning("radius outlier removal failed: %s", exc)
 
     return cleaned
 

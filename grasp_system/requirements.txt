@@ -1,4 +1,8 @@
 # Core scientific stack
+# numpy 1.26.4 is the version actively tested in CI and on the
+# reference workstation; the bound below allows any recent 1.2x/1.3x
+# patch release so integrators can track their distro's security
+# updates without editing this file.
 numpy>=1.24,<2.0
 scipy>=1.10
 

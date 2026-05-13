@@ -46,11 +46,19 @@ variables, and files; use `PascalCase` for classes. Keep YAML paths relative to
 
 ## Testing Guidelines
 
-There is no formal test suite yet. Before submitting changes, at minimum run:
+Run the unit test suite (no hardware required) and the byte-compile
+sanity check from the repository root:
 
 ```bash
+python -m pytest -q
 python -m py_compile $(find grasp_system -name '*.py')
 ```
+
+The pytest suite lives under `tests/` and covers the transform helpers
+in `grasp_system.common` and the planner utilities in
+`grasp_system.planning.grasp_planner`. Perception, camera, and motion
+modules are hardware-dependent and are not covered by unit tests --
+smoke-test those on real hardware with `--dry-run` first.
 
 For perception or training changes, run a YOLO validation/training smoke test
 against `grasp_system/datasets/my_first_project_v3i_yolov8/data.yaml`. For robot

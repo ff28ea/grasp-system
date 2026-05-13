@@ -222,14 +222,56 @@ def load_npy(path: str | Path) -> np.ndarray:
 
 
 def load_intrinsics(path: str | Path) -> Dict[str, Any]:
-    """Load camera intrinsics saved by calibrate_intrinsics.py."""
-    data = np.load(path, allow_pickle=False)
-    out = {
-        "K": data["K"].astype(np.float64),
-        "dist": data["dist"].astype(np.float64),
-        "width": int(data["width"]),
-        "height": int(data["height"]),
-    }
+    """Load camera intrinsics saved by calibrate_intrinsics.py.
+
+    Validates shape, dtype, and basic plausibility (fx > 0, image size
+    positive). A corrupt or out-of-date calibration file produces a
+    clear ``ValueError`` at load time rather than a mysterious
+    "back-projected nothing" downstream.
+    """
+    path = Path(path)
+    try:
+        data = np.load(path, allow_pickle=False)
+    except Exception as exc:  # pragma: no cover - filesystem dependent
+        raise FileNotFoundError(
+            f"failed to read intrinsics from {path}: {exc}"
+        ) from exc
+
+    missing = [k for k in ("K", "dist", "width", "height") if k not in data.files]
+    if missing:
+        raise ValueError(
+            f"intrinsics file {path} is missing required keys: {missing}. "
+            "Re-run `python -m grasp_system.calibration.calibrate_intrinsics`."
+        )
+
+    K = np.asarray(data["K"], dtype=np.float64)
+    dist = np.asarray(data["dist"], dtype=np.float64)
+    width = int(data["width"])
+    height = int(data["height"])
+
+    if K.shape != (3, 3):
+        raise ValueError(f"intrinsics K must be 3x3, got {K.shape} from {path}")
+    if dist.ndim != 1 and dist.ndim != 2:
+        raise ValueError(f"intrinsics dist must be 1D or 2D, got shape {dist.shape}")
+    # OpenCV supports 4/5/8/12/14 distortion coefficients; anything else
+    # is almost certainly a file authored by hand with a wrong layout.
+    dist_flat = dist.reshape(-1)
+    if dist_flat.size not in (4, 5, 8, 12, 14):
+        raise ValueError(
+            f"intrinsics dist has {dist_flat.size} coefficients; expected "
+            "4/5/8/12/14 (OpenCV convention)"
+        )
+    if not (K[0, 0] > 0 and K[1, 1] > 0):
+        raise ValueError(
+            f"intrinsics K has non-positive focal length ({K[0, 0]}, {K[1, 1]}); "
+            "calibration likely failed"
+        )
+    if width <= 0 or height <= 0:
+        raise ValueError(
+            f"intrinsics image size {width}x{height} is non-positive"
+        )
+
+    out: Dict[str, Any] = {"K": K, "dist": dist, "width": width, "height": height}
     if "rms" in data.files:
         out["rms"] = float(data["rms"])
     return out
