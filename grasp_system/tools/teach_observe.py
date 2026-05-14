@@ -19,6 +19,36 @@ from ..control.piper_controller import PiperController
 from ..perception.camera import RealSenseCamera
 
 
+_JOINT_NAMES = ("J1", "J2", "J3", "J4", "J5", "J6")
+
+
+def _joint_limit_status(joints_deg: np.ndarray, limits_deg: np.ndarray) -> tuple[bool, list[str]]:
+    """Return whether joints are within configured limits plus readable violations."""
+    eps = 1e-3
+    bad: list[str] = []
+    for i, (angle, (lo, hi)) in enumerate(zip(joints_deg, limits_deg)):
+        if angle < lo - eps:
+            bad.append(f"{_JOINT_NAMES[i]} {angle:.2f} < {lo:.2f} ({lo - angle:.2f} deg)")
+        elif angle > hi + eps:
+            bad.append(f"{_JOINT_NAMES[i]} {angle:.2f} > {hi:.2f} ({angle - hi:.2f} deg)")
+    return len(bad) == 0, bad
+
+
+def _put_status_lines(vis: np.ndarray, lines: list[str], color: tuple[int, int, int]) -> None:
+    y = 30
+    for line in lines:
+        cv2.putText(
+            vis,
+            line,
+            (10, y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.62,
+            color,
+            2,
+        )
+        y += 28
+
+
 def _save_observe_pose(piper: PiperController, out_path: Path, log) -> None:
     joints_rad = piper.get_joints_rad()
     piper.validate_joints_rad(joints_rad)
@@ -48,6 +78,7 @@ def main() -> None:
 
     piper = PiperController(can_port=args.can_port, enable_on_connect=False)
     piper.connect()
+    piper.set_joint_limits_from_config(cfg)
     try:
         if args.no_preview:
             input("Move / teach the arm to the observe pose, then press ENTER: ")
@@ -72,7 +103,7 @@ def main() -> None:
         cv2.setMouseCallback(window_name, _request_save_on_left_click)
         log.info(
             "use the arm's physical teach button to position the camera; "
-            "SPACE/left-click=save observe pose, ESC=quit"
+            "SPACE/left-click saves only when the joint-limit overlay is green; ESC=quit"
         )
 
         cam_cfg = cfg.get("camera", {})
@@ -88,21 +119,29 @@ def main() -> None:
             while True:
                 color, _ = cam.grab_aligned()
                 joints_deg = piper.get_joints_deg()
+                limits_deg = np.rad2deg(piper.joint_limits_rad)
+                ok_limits, violations = _joint_limit_status(joints_deg, limits_deg)
 
                 vis = color.copy()
-                cv2.putText(
-                    vis,
-                    "SPACE/click=save observe pose  ESC=quit",
-                    (10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.65,
-                    (0, 255, 0),
-                    2,
-                )
+                if ok_limits:
+                    _put_status_lines(
+                        vis,
+                        ["JOINT LIMITS OK - SPACE/click to save", "ESC=quit"],
+                        (0, 220, 0),
+                    )
+                else:
+                    shown = violations[:3]
+                    if len(violations) > 3:
+                        shown.append(f"... {len(violations) - 3} more")
+                    _put_status_lines(
+                        vis,
+                        ["OUTSIDE JOINT LIMITS - adjust before saving", *shown],
+                        (0, 0, 255),
+                    )
                 cv2.putText(
                     vis,
                     "joints deg: " + np.array2string(joints_deg, precision=1),
-                    (10, 60),
+                    (10, vis.shape[0] - 20),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.5,
                     (255, 255, 255),
@@ -117,6 +156,12 @@ def main() -> None:
                     log.info("quit without saving observe pose")
                     break
                 if key == 32 or clicked:
+                    if not ok_limits:
+                        log.warning(
+                            "not saving observe pose outside configured limits: %s",
+                            "; ".join(violations),
+                        )
+                        continue
                     _save_observe_pose(piper, args.out, log)
                     break
     finally:
