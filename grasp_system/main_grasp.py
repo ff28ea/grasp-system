@@ -85,6 +85,27 @@ def _up_direction_in_cam(T_B_E: np.ndarray, T_E_C: np.ndarray) -> np.ndarray:
     return R_C_B @ np.array([0.0, 0.0, 1.0], dtype=np.float64)
 
 
+def _tool_offset_eef_m(cfg: dict) -> np.ndarray:
+    """EEF-frame vector from SDK end-effector origin to the grasp TCP."""
+    return np.asarray(
+        cfg.get("grasp", {}).get("tool_offset_eef_m", [0.0, 0.0, 0.0]),
+        dtype=np.float64,
+    ).reshape(3)
+
+
+def _eef_pose_for_tcp_pose(
+    T_B_tcp: np.ndarray,
+    tool_offset_eef_m: np.ndarray,
+) -> np.ndarray:
+    """Convert a desired TCP/gripper-center pose into a PiPER EEF command."""
+    T_B_tcp = np.asarray(T_B_tcp, dtype=np.float64)
+    T_B_E = T_B_tcp.copy()
+    T_B_E[:3, 3] = T_B_tcp[:3, 3] - T_B_tcp[:3, :3] @ np.asarray(
+        tool_offset_eef_m, dtype=np.float64
+    ).reshape(3)
+    return T_B_E
+
+
 def _refine_pose_with_icp_if_enabled(
     pcd_cam,
     pose_cam,
@@ -375,7 +396,7 @@ def _safe_retreat(
         piper.move_to_pose(
             target,
             linear=True,
-            speed_pct=max(5, int(piper_cfg.get("cartesian_move_speed_pct", 20)) // 2),
+            speed_pct=max(2, int(piper_cfg.get("cartesian_move_speed_pct", 5)) // 2),
             pos_tol_m=float(m_cfg.get("pos_tol_m", 0.003)),
             ang_tol_deg=float(m_cfg.get("ang_tol_deg", 1.0)),
             timeout_s=float(m_cfg.get("cartesian_timeout_s", 8.0)),
@@ -561,23 +582,23 @@ def _execute_grasp(
     gripper_open_settle = float(t_cfg.get("gripper_open_settle_s", 0.3))
     waypoint_settle = float(t_cfg.get("waypoint_settle_s", 0.2))
     place_release = float(t_cfg.get("place_release_s", 0.5))
+    tool_offset = _tool_offset_eef_m(cfg)
+    log.info(
+        "using grasp TCP offset in EEF frame: %s m",
+        np.array2string(tool_offset, precision=3),
+    )
 
-    def _move(tag: str, pose: np.ndarray, *, linear: bool, speed: int) -> None:
-        """Command a cartesian target and fail loud on timeout.
-
-        Wraps :py:meth:`PiperController.move_to_pose` so every waypoint
-        in the grasp sequence checks its own arrival. Previously we
-        called ``end_pose_ctrl`` + ``wait_cartesian_arrive`` and threw
-        away the boolean -- a timeout on the approach would silently
-        continue into ``close_until`` and the lift motion, potentially
-        driving the arm through the object / table.
-        """
+    def _move_tcp(tag: str, tcp_pose: np.ndarray, *, linear: bool, speed: int) -> None:
+        """Command a TCP target after converting it to a PiPER EEF pose."""
+        eef_pose = _eef_pose_for_tcp_pose(tcp_pose, tool_offset)
         log.info(
-            "moving to %s: xyz=%s",
-            tag, np.array2string(pose[:3, 3], precision=3),
+            "moving to %s: tcp_xyz=%s eef_xyz=%s",
+            tag,
+            np.array2string(tcp_pose[:3, 3], precision=3),
+            np.array2string(eef_pose[:3, 3], precision=3),
         )
         ok = piper.move_to_pose(
-            pose,
+            eef_pose,
             linear=linear,
             speed_pct=speed,
             pos_tol_m=pos_tol,
@@ -586,7 +607,7 @@ def _execute_grasp(
         )
         if not ok:
             cur = piper.get_end_pose_matrix()
-            err_xyz = cur[:3, 3] - pose[:3, 3]
+            err_xyz = cur[:3, 3] - eef_pose[:3, 3]
             raise RuntimeError(
                 f"timeout reaching {tag}; residual xyz error "
                 f"({err_xyz[0]*1000:.1f}, {err_xyz[1]*1000:.1f}, {err_xyz[2]*1000:.1f}) mm"
@@ -599,14 +620,14 @@ def _execute_grasp(
     )
     time.sleep(gripper_open_settle)
 
-    _move("pre-grasp", grasp.pre_grasp, linear=False, speed=speed_cart)
+    _move_tcp("pre-grasp", grasp.pre_grasp, linear=False, speed=speed_cart)
     time.sleep(waypoint_settle)
 
-    _move(
+    _move_tcp(
         "grasp",
         grasp.T_B_grasp,
         linear=True,
-        speed=max(5, speed_cart // 2),
+        speed=max(2, speed_cart // 2),
     )
     time.sleep(waypoint_settle)
 
@@ -649,11 +670,11 @@ def _execute_grasp(
             f"(tol {grasp_tol_m*1000:.1f} mm); object likely slipped or missing"
         )
 
-    _move("lift", grasp.lift, linear=True, speed=max(5, speed_cart // 2))
+    _move_tcp("lift", grasp.lift, linear=True, speed=max(2, speed_cart // 2))
     time.sleep(waypoint_settle)
 
     if place_pose_base is not None:
-        _move("place", place_pose_base, linear=False, speed=speed_cart)
+        _move_tcp("place", place_pose_base, linear=False, speed=speed_cart)
         piper.open_gripper(
             opening_m=float(g_cfg["max_opening_m"]),
             effort_mNm=effort_mNm,
@@ -825,6 +846,11 @@ def main() -> None:
         help="perceive + plan but do not move the arm during the grasp",
     )
     ap.add_argument(
+        "--execute",
+        action="store_true",
+        help="actually execute the planned grasp; default is plan-only for safety",
+    )
+    ap.add_argument(
         "--visualize",
         action="store_true",
         help="write detection overlays, point clouds, and poses to --viz-dir",
@@ -846,6 +872,8 @@ def main() -> None:
         help="skip the confirm-before-motion prompt used with --viz-3d",
     )
     args = ap.parse_args()
+    if not args.execute:
+        args.dry_run = True
 
     cfg = load_config(args.config)
 
@@ -918,14 +946,15 @@ def main() -> None:
         can_port=can_port,
         installation_pos=install_pos,
     ) as piper:
+        piper.set_joint_limits_from_config(cfg)
         # Keep the arm enabled after the process exits. Disabling all joints
         # at shutdown is surprising during bring-up and can make the arm sag.
         piper.disable_on_disconnect = False
 
-        # One-shot soft-stop guard: any exception or Ctrl+C from this
-        # point on triggers the safe retreat + soft stop path, so the
-        # arm never ends a run still holding an object or in the middle
-        # of a MOVE_L.
+        # One-shot soft-stop guard. Do not attempt automatic cartesian
+        # retreat on exceptions while the TCP / hand-eye chain is being
+        # commissioned: if coordinates are wrong, a "retreat" command can
+        # be just as dangerous as the failed command.
         try:
             _run_pipeline(
                 piper=piper,
@@ -950,11 +979,11 @@ def main() -> None:
                 log.warning("piper.stop() raised: %s", exc)
             raise
         except Exception:
-            log.exception("pipeline error; attempting safe retreat")
+            log.exception("pipeline error; soft-stopping arm")
             try:
-                _safe_retreat(piper, cfg, log)
+                piper.stop()
             except Exception as exc:
-                log.warning("safe_retreat raised: %s", exc)
+                log.warning("piper.stop() raised: %s", exc)
             raise
 
 
@@ -993,11 +1022,31 @@ def _run_pipeline(
     _go_to_observe(piper, cfg, log)
 
     # 2-3) perception with optional active close-up
-    det, T_B_O_final, extent_final, pcd_best_cam, T_B_E_best = _perceive_with_fusion(
+    (
+        det,
+        T_B_O_final,
+        extent_final,
+        pcd_best_cam,
+        T_B_E_best,
+        active_ok,
+    ) = _perceive_with_fusion(
         piper=piper, cam=cam, detector=detector, cfg=cfg, classes=classes,
         target_class=target_class, T_E_C=T_E_C, K_cal=K_cal, dist_cal=dist_cal,
         viz_dir=viz_dir, no_active=args.no_active_perception, log=log,
     )
+    ap_cfg = cfg.get("active_perception", {}) or {}
+    if (
+        not args.dry_run
+        and bool(ap_cfg.get("require_for_motion", False))
+        and bool(ap_cfg.get("enable", True))
+        and not args.no_active_perception
+        and not active_ok
+    ):
+        raise RuntimeError(
+            "active perception did not produce a close-up pose; refusing real "
+            "grasp from rough pose. Use --dry-run to inspect the rough plan, "
+            "or fix the close-up reachability/calibration first."
+        )
 
     # 4-5) plan + visualize
     grasp, place, close_effort_mNm = _build_and_validate_plan(
@@ -1112,7 +1161,7 @@ def _perceive_with_fusion(
 ) -> tuple:
     """Run rough perception + optional active close-up and fuse results.
 
-    Returns (det, T_B_O_final, extent_final, pcd_best_cam, T_B_E_best).
+    Returns (det, T_B_O_final, extent_final, pcd_best_cam, T_B_E_best, active_ok).
     """
     # Rough perception
     det, pose_cam_rough, T_B_E_rough, T_B_O_rough, color_rough, pcd_rough_cam = _snapshot_T_B_O(
@@ -1135,6 +1184,7 @@ def _perceive_with_fusion(
     T_B_E_best = T_B_E_rough
     T_B_O_final = T_B_O_rough
     extent_final = pose_cam_rough.extent
+    active_ok = not (cfg["active_perception"].get("enable", True) and not no_active)
 
     # Optional close-up active perception
     if cfg["active_perception"].get("enable", True) and not no_active:
@@ -1170,10 +1220,11 @@ def _perceive_with_fusion(
                 "T_B_O (fused) translation: %s",
                 np.array2string(T_B_O_final[:3, 3], precision=4),
             )
+            active_ok = True
         except Exception as exc:
             log.warning("active perception failed (%s); using rough estimate", exc)
 
-    return det, T_B_O_final, extent_final, pcd_best_cam, T_B_E_best
+    return det, T_B_O_final, extent_final, pcd_best_cam, T_B_E_best, active_ok
 
 
 def _build_and_validate_plan(
@@ -1216,6 +1267,7 @@ def _build_and_validate_plan(
         approach_m=float(cfg["grasp"]["pre_grasp_offset_m"]),
         lift_m=lift_m,
         max_opening_m=max_opening_m,
+        center_height_offset_m=float(cfg["grasp"].get("center_height_offset_m", 0.0)),
         workspace=cfg.get("workspace"),
     )
     log.info(

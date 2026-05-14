@@ -80,3 +80,18 @@ temporary training artifacts. Treat `configs/camera_intrinsics.npz`,
 `configs/T_eef_cam.npy`, and `configs/observe_joints.npy` as hardware-specific
 outputs. Recalibrate after changing camera mounting, end-effector geometry, or
 RealSense resolution.
+
+## Mandatory Robot Safety Limits
+
+The PiPER arm must always enforce these software joint limits in addition to
+the factory/UI limits:
+
+- J1: `-1.46 rad <= J1 <= 0.0 rad` (`-83.65 deg <= J1 <= 0.0 deg`)
+- J3: `-0.72 rad <= J3 <= 0.0 rad` (`-41.25 deg <= J3 <= 0.0 deg`)
+
+Keep these limits encoded in `grasp_system/configs/system.yaml` under
+`piper.joint_limits_deg`, and do not remove or bypass the runtime checks in
+`grasp_system.control.piper_controller.PiperController`. Any new motion entry
+point must load the configured limits before commanding the arm. If an observe
+pose, calibration pose, grasp plan, or Cartesian IK result violates these
+limits, abort the motion rather than relaxing the limits.

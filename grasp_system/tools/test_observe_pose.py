@@ -49,6 +49,7 @@ def main() -> None:
     log.info("target joints (deg): %s", np.array2string(np.rad2deg(target), precision=3))
     piper = PiperController(can_port=args.can_port, enable_on_connect=not args.no_move)
     piper.connect()
+    piper.set_joint_limits_from_config(cfg)
     piper.disable_on_disconnect = False
     try:
         current = piper.get_joints_rad()

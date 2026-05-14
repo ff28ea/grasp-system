@@ -37,11 +37,15 @@ handeye:
   settle_time_s: 1.0
 
 observe:
-  move_speed_pct: 50
+  move_speed_pct: 10
   arrive_timeout_s: 20.0
 
 active_perception:
   enable: true
+  # If the close-up view cannot be reached/refined, do not execute real
+  # motion from the rough one-shot pose. Dry-run still reports the rough
+  # plan for debugging.
+  require_for_motion: true
   near_height_m: 0.35         # camera height above object for close-up
   look_down_tilt_deg: 10.0    # tilt of camera optical axis away from world -z
   fuse_rough_weight: 0.3
@@ -94,6 +98,14 @@ perception:
 
 grasp:
   approach_direction_world: [0.0, 0.0, -1.0]
+  # EEF-frame vector from the SDK end-effector origin/flange to the
+  # physical grasp TCP (between the fingertips), in meters.
+  # Sign depends on the PiPER tool frame. Verify with teach_table_height
+  # and a small positive-Z test before enabling real grasp execution.
+  tool_offset_eef_m: [0.0, 0.0, 0.0]
+  # Optional TCP height bias relative to the OBB center. Positive raises
+  # the grasp point above the detected object center.
+  center_height_offset_m: 0.0
   pre_grasp_offset_m: 0.10
   lift_height_m: 0.12
   opening_margin_m: 0.005
@@ -150,7 +162,9 @@ motion:
 # motion phase with a human-readable message if violated.
 workspace:
   # Z of the support surface in the base frame (m).
-  table_z_m: 0.0
+  # Calibrate this with:
+  #   python -m grasp_system.tools.teach_table_height
+  table_z_m: -0.015741
   # Minimum clearance the tool tip must keep above the table.
   safe_z_min_m: 0.005
   # Reachable rectangle: [[xmin, xmax], [ymin, ymax]] in m.
@@ -161,8 +175,26 @@ workspace:
 
 piper:
   can_port: can0
-  joint_move_speed_pct: 30
-  cartesian_move_speed_pct: 20
+  joint_move_speed_pct: 10
+  cartesian_move_speed_pct: 5
+  # Optional stricter software joint limits in degrees. When set, every
+  # joint-space command through PiperController is checked before motion.
+  # Generate a template from the current pose with:
+  #   python -m grasp_system.tools.save_joint_limits --margin-deg 10
+  # joint_limits_deg:
+  #   - [-150.0, 150.0]   # J1
+  #   - [0.0, 180.0]      # J2
+  #   - [-154.5, 0.0]     # J3
+  #   - [-105.0, 105.0]   # J4
+  #   - [-69.9, 69.9]     # J5
+  #   - [-120.0, 120.0]   # J6
+  joint_limits_deg:
+    - [-83.65, 0.0]      # J1: -1.46..0 rad
+    - [0.0, 179.91]      # J2: PiPER UI default
+    - [-41.25, 0.0]      # J3: -0.72..0 rad
+    - [-104.97, 104.97]  # J4: PiPER UI default
+    - [-69.90, 69.90]    # J5: PiPER UI default
+    - [-120.00, 120.00]  # J6: PiPER UI default
   default_effort_mNm: 1000
   # Arm installation orientation. Required on firmware >= V1.5-2 so
   # gravity compensation and IK are correct. One of:

@@ -160,6 +160,7 @@ class PiperController:
         self.enable_on_connect = enable_on_connect
         self.installation_pos: Optional[InstallPos] = installation_pos
         self.disable_on_disconnect = True
+        self.joint_limits_rad = _JOINT_LIMITS_RAD.copy()
         self._piper: Optional[C_PiperInterface_V2] = None
         self._log = get_logger("piper")
 
@@ -492,23 +493,68 @@ class PiperController:
             raise ValueError("joint target contains NaN or Inf")
 
         eps = 1e-6
-        below = joints < (_JOINT_LIMITS_RAD[:, 0] - eps)
-        above = joints > (_JOINT_LIMITS_RAD[:, 1] + eps)
+        below = joints < (self.joint_limits_rad[:, 0] - eps)
+        above = joints > (self.joint_limits_rad[:, 1] + eps)
         bad = np.where(below | above)[0]
         if bad.size == 0:
             return
 
         joints_deg = np.rad2deg(joints)
-        limits_deg = np.rad2deg(_JOINT_LIMITS_RAD)
+        limits_deg = np.rad2deg(self.joint_limits_rad)
         details = ", ".join(
             f"{_JOINT_NAMES[i]}={joints_deg[i]:.3f} deg "
             f"outside [{limits_deg[i, 0]:.3f}, {limits_deg[i, 1]:.3f}] deg"
             for i in bad
         )
         raise ValueError(
-            "joint target is outside the Piper UI joint limits: "
+            "joint target is outside the configured joint limits: "
             f"{details}. Re-teach the observe pose inside these limits."
         )
+
+    def set_joint_limits_deg(self, limits_deg: Sequence[Sequence[float]]) -> None:
+        """Install stricter per-joint software limits in degrees.
+
+        The configured limits must be inside the built-in PiPER UI limits.
+        These are software guardrails for commands sent through this Python
+        wrapper; they do not change firmware limits.
+        """
+        limits = np.asarray(limits_deg, dtype=np.float64)
+        if limits.shape != (6, 2):
+            raise ValueError(f"joint_limits_deg must be 6x2, got {limits.shape}")
+        if not np.all(np.isfinite(limits)):
+            raise ValueError("joint_limits_deg contains NaN or Inf")
+        if np.any(limits[:, 0] >= limits[:, 1]):
+            raise ValueError("each joint limit must be [min_deg, max_deg] with min < max")
+
+        limits_rad = np.deg2rad(limits)
+        eps = np.deg2rad(0.01)
+        if np.any(limits_rad[:, 0] < _JOINT_LIMITS_RAD[:, 0] - eps) or np.any(
+            limits_rad[:, 1] > _JOINT_LIMITS_RAD[:, 1] + eps
+        ):
+            ui_deg = np.rad2deg(_JOINT_LIMITS_RAD)
+            raise ValueError(
+                "joint_limits_deg must stay within PiPER UI limits; "
+                f"requested={limits.tolist()}, ui={ui_deg.tolist()}"
+            )
+
+        self.joint_limits_rad = limits_rad
+        self._log.info("configured joint limits (deg): %s", np.array2string(limits, precision=2))
+
+    def set_joint_limits_from_config(self, cfg: dict) -> None:
+        limits = (cfg.get("piper", {}) or {}).get("joint_limits_deg")
+        if limits is not None:
+            self.set_joint_limits_deg(limits)
+
+    def _stop_if_current_joints_violate_limits(self, context: str) -> None:
+        """Soft-stop if feedback reports a joint outside software limits."""
+        try:
+            self.validate_joints_rad(self.get_joints_rad())
+        except ValueError as exc:
+            self.stop()
+            raise RuntimeError(
+                f"{context}: current joint feedback violated configured limits; "
+                "soft-stopped arm"
+            ) from exc
 
     def get_joints_rad(self) -> np.ndarray:
         msg = self.raw.GetArmJointMsgs().joint_state
@@ -627,8 +673,10 @@ class PiperController:
         t_target = T_target[:3, 3]
         t0 = time.time()
         while time.time() - t0 < timeout_s:
+            self._stop_if_current_joints_violate_limits("cartesian move")
             self.raw.MotionCtrl_2(0x01, move_mode, command_speed, 0x00)
             self.raw.EndPoseCtrl(*cmd)
+            self._stop_if_current_joints_violate_limits("cartesian move")
             cur = self.get_end_pose_matrix()
             if (
                 float(np.linalg.norm(cur[:3, 3] - t_target)) <= pos_tol_m
